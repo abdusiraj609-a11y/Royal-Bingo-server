@@ -477,11 +477,11 @@ else:
     print("BOT_TOKEN not set — Telegram bot will not start.")
 
 @app.route('/telegram-webhook', methods=['POST'])
-async def telegram_webhook():
+def telegram_webhook():
     if bot_app is None:
         return jsonify({'error': 'Bot not configured'}), 500
     update = Update.de_json(request.get_json(force=True), bot_app.bot)
-    await bot_app.process_update(update)
+    asyncio.run(bot_app.process_update(update))
     return jsonify({'status': 'ok'})
 
 def set_webhook():
