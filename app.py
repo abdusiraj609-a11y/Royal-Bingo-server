@@ -465,7 +465,7 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"ስህተት: {str(e)}")
 
-# إنشاء تطبيق البوت على مستوى الوحدة (لكي يستخدمه webhook)
+# إعداد البوت والـ webhook
 bot_app = None
 if BOT_TOKEN:
     bot_app = Application.builder().token(BOT_TOKEN).build()
@@ -493,10 +493,3 @@ def set_webhook():
 # بدء البوت وضبط webhook
 if bot_app is not None:
     threading.Thread(target=set_webhook, daemon=True).start()
-# ========== تشغيل ==========
-# بدء بوت تيليغرام إذا تم ضبط التوكن — يعمل مع gunicorn
-if BOT_TOKEN:
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-else:
-    print("BOT_TOKEN not set — Telegram bot will not start.")
