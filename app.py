@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import sqlite3
+import requests
+import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -8,7 +10,6 @@ app = Flask(__name__)
 CORS(app)  # ከየትኛውም ምንጭ ጥያቄዎችን መቀበል ያስችላል
 
 # የማስመሰል ሁነታ፡ True ማለት ተቀማጭ ወዲያውኑ ይፈጸማል (ለሙከራ)
-SIMULATION_MODE = True
 
 DB_NAME = "bingo.db"
 
@@ -88,21 +89,42 @@ def add_transaction(player_id, trans_type, amount, status='completed', reference
     conn.close()
     return tx_id
 
-def process_deposit(player_id, amount, reference='deposit'):
-    """የተቀማጭ ሂደት ማስመሰል"""
-    if SIMULATION_MODE:
-        # የክፍያ ስኬት ማስመሰል
-        conn = get_db()
-        conn.execute('UPDATE players SET balance = balance + ? WHERE id = ?', (amount, player_id))
-        conn.commit()
-        conn.close()
+def verify_telebirr_transaction(transaction_id):
+    VERIFY_ET_API_KEY = os.environ.get('VERIFY_ET_API_KEY', '')
+    VERIFY_ET_BASE_URL = "https://verify.et"
 
-        tx_id = add_transaction(player_id, 'deposit', amount, 'completed', reference)
-        return {'success': True, 'transactionId': tx_id, 'message': 'ተቀማጭ ገንዘብ ጸድቋል (ማስመሰል)'}
-    else:
-        # እዚህ እውነተኛ የክፍያ በር መጠቀም ያስፈልጋል
-        raise Exception('እውነተኛ የክፍያ መግቢያ አልተዋቀረም')
+    url = f"{VERIFY_ET_BASE_URL}/api/verify?waitMs=5000"
 
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": VERIFY_ET_API_KEY,
+        "Idempotency-Key": f"verify-{uuid.uuid4()}"
+    }
+
+    payload = {
+        "bank": "telebirr",
+        "transactionNumber": transaction_id
+    }
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        data = response.json()
+
+        if response.status_code != 200:
+            return False, data.get("message", "Verification request failed")
+
+        verification = data.get("verification", {})
+        if verification.get("verified") or (data.get("success") and data.get("data")):
+            transactions = data.get("data", [])
+            if transactions:
+                amount = transactions[0].get("amount")
+                return True, amount
+            else:
+                return True, None
+        else:
+            return False, data.get("message", "Transaction not verified")
+    except Exception as e:
+        return False, str(e)
 # ========== API መጨረሻዎች ==========
 
 @app.route('/')
@@ -152,20 +174,40 @@ def get_balance(player_id):
 
 @app.route('/api/deposits', methods=['POST'])
 def deposit():
-    """ራስ-ሰር ተቀማጭ (ማስመሰል)"""
     data = request.json
     player_id = data.get('player_id')
     amount = data.get('amount')
-    reference = data.get('reference', 'deposit')
+    transaction_id = data.get('transaction_id')
 
     if not player_id or not amount or amount <= 0:
         return jsonify({'error': 'የተሳሳተ የተጫዋች መለያ ወይም መጠን'}), 400
+    if not transaction_id:
+        return jsonify({'error': 'የግብይት ቁጥር ያስፈልጋል'}), 400
 
-    try:
-        result = process_deposit(player_id, amount, reference)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    # التحقق من المعاملة عبر Verify.et
+    is_valid, verified_amount = verify_telebirr_transaction(transaction_id)
+
+    if not is_valid:
+        return jsonify({'error': 'ግብይቱ አልተረጋገጠም'}), 400
+
+    # إذا كان المبلغ المسترجع متاحًا وكان أقل من المبلغ المدخل نرفض
+    if verified_amount is not None and float(verified_amount) < amount:
+        return jsonify({'error': 'የገንዘብ መጠኑ ከተረጋገጠው ጋር አይዛመድም'}), 400
+
+    # المعاملة صحيحة — نضيف الرصيد
+    conn = get_db()
+    conn.execute('UPDATE players SET balance = balance + ? WHERE id = ?', (amount, player_id))
+    conn.commit()
+    conn.close()
+
+    # تسجيل المعاملة في الجدول
+    tx_id = add_transaction(player_id, 'deposit', amount, 'completed', transaction_id)
+
+    return jsonify({
+        'success': True,
+        'transactionId': tx_id,
+        'message': 'ገንዘቡ በተሳካ ሁኔታ ገብቷል'
+    })
 
 @app.route('/api/withdrawals', methods=['POST'])
 def withdraw():
