@@ -480,9 +480,17 @@ else:
 def telegram_webhook():
     if bot_app is None:
         return jsonify({'error': 'Bot not configured'}), 500
-    update = Update.de_json(request.get_json(force=True), bot_app.bot)
-    asyncio.run(bot_app.process_update(update))
-    return jsonify({'status': 'ok'})
+
+    try:
+        update = Update.de_json(request.get_json(force=True), bot_app.bot)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(bot_app.process_update(update))
+        loop.close()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        app.logger.error(f"Webhook error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 def set_webhook():
     if bot_app is None:
