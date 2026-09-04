@@ -476,9 +476,9 @@ def run_bot():
     bot_app.run_polling()
 
 # ========== تشغيل ==========
-if __name__ == '__main__':
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
+# بدء بوت تيليغرام إذا تم ضبط التوكن — يعمل مع gunicorn
+if BOT_TOKEN:
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
-
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
+else:
+    print("BOT_TOKEN not set — Telegram bot will not start.")
