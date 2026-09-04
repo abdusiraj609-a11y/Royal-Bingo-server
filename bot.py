@@ -93,7 +93,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("royal-bingo")
-
+app = Flask(__name__)
 
 # ============================================================
 # DATABASE
