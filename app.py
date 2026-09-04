@@ -4,6 +4,7 @@ import sqlite3
 import requests
 import uuid
 import threading
+import asyncio
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -464,17 +465,34 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"ስህተት: {str(e)}")
 
-def run_bot():
-    if not BOT_TOKEN:
-        print("BOT_TOKEN not set, bot will not start.")
-        return
+# إنشاء تطبيق البوت على مستوى الوحدة (لكي يستخدمه webhook)
+bot_app = None
+if BOT_TOKEN:
     bot_app = Application.builder().token(BOT_TOKEN).build()
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("deposit", deposit_command))
     bot_app.add_handler(CommandHandler("withdraw", withdraw_command))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
-    bot_app.run_polling()
+else:
+    print("BOT_TOKEN not set — Telegram bot will not start.")
 
+@app.route('/telegram-webhook', methods=['POST'])
+async def telegram_webhook():
+    if bot_app is None:
+        return jsonify({'error': 'Bot not configured'}), 500
+    update = Update.de_json(request.get_json(force=True), bot_app.bot)
+    await bot_app.process_update(update)
+    return jsonify({'status': 'ok'})
+
+def set_webhook():
+    if bot_app is None:
+        return
+    webhook_url = f"{os.environ.get('RENDER_EXTERNAL_URL', 'https://royal-bingo-server.onrender.com')}/telegram-webhook"
+    asyncio.run(bot_app.bot.set_webhook(webhook_url))
+
+# بدء البوت وضبط webhook
+if bot_app is not None:
+    threading.Thread(target=set_webhook, daemon=True).start()
 # ========== تشغيل ==========
 # بدء بوت تيليغرام إذا تم ضبط التوكن — يعمل مع gunicorn
 if BOT_TOKEN:
