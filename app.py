@@ -3,22 +3,27 @@ import os
 import sqlite3
 import requests
 import uuid
+import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 app = Flask(__name__)
 CORS(app)
 
-# ========== ቋሚዎች ==========
+# ========== الإعدادات ==========
 DB_NAME = "bingo.db"
-CONFIG_ENTRY_STAKE = 10        # የአንድ ካርቴላ ዋጋ በ ETB
-CONFIG_PAYOUT_RATIO = 0.80     # 80% ወደ ሽልማት መዋዕለ ንዋይ
+CONFIG_ENTRY_STAKE = 10
+CONFIG_PAYOUT_RATIO = 0.80
 ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', 'change-this-secret-token')
 VERIFY_ET_API_KEY = os.environ.get('VERIFY_ET_API_KEY', '')
 VERIFY_ET_BASE_URL = "https://verify.et"
+TELEBIRR_SETTLEMENT_ACCOUNT = os.environ.get('TELEBIRR_SETTLEMENT_ACCOUNT', '')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 
-# ========== የውሂብ ጎታ ማስጀመሪያ ==========
+# ========== قاعدة البيانات ==========
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -99,15 +104,13 @@ def init_db():
         FOREIGN KEY (cartela_id) REFERENCES cartelas(id)
     )''')
 
-    # ነባሪ ክፍት ዙር መፍጠር
     c.execute('INSERT OR IGNORE INTO rounds (id, round_number, status) VALUES (1, 1, "open")')
-
     conn.commit()
     conn.close()
 
 init_db()
 
-# ========== አጋዥ ተግባራት ==========
+# ========== دوال مساعدة ==========
 def get_db():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -145,6 +148,9 @@ def verify_telebirr_transaction(transaction_id):
         "bank": "telebirr",
         "transactionNumber": transaction_id
     }
+    if TELEBIRR_SETTLEMENT_ACCOUNT:
+        payload["settlementAccount"] = TELEBIRR_SETTLEMENT_ACCOUNT
+
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         data = response.json()
@@ -163,7 +169,7 @@ def verify_telebirr_transaction(transaction_id):
     except Exception as e:
         return False, str(e)
 
-# ========== API መጨረሻዎች ==========
+# ========== نقاط API ==========
 @app.route('/')
 def home():
     return jsonify({'message': 'የሮያል ቢንጎ አገልጋይ እየሰራ ነው'})
@@ -338,5 +344,141 @@ def reject_withdrawal(request_id):
     conn.close()
     return jsonify({'success': True})
 
+# ========== بوت تيليغرام ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("💰 Balance", callback_data='balance')],
+        [InlineKeyboardButton("💸 Deposit", callback_data='deposit'),
+         InlineKeyboardButton("💵 Withdraw", callback_data='withdraw')],
+        [InlineKeyboardButton("🔗 Referral", callback_data='referral'),
+         InlineKeyboardButton("🆘 Support", callback_data='support')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("እንኳን ደህና መጡ! አንዱን ይምረጡ፡", reply_markup=reply_markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == 'balance':
+        telegram_id = str(query.from_user.id)
+        conn = get_db()
+        player = conn.execute('SELECT * FROM players WHERE telegram_id = ?', (telegram_id,)).fetchone()
+        conn.close()
+        if player:
+            balance = player['balance']
+            await query.edit_message_text(f"የእርስዎ ቀሪ ሂሳብ: {balance:.2f} ETB")
+        else:
+            await query.edit_message_text("አሁንም ተጫዋች አይደሉም። በመጀመሪያ ጨዋታውን ይክፈቱ።")
+
+    elif data == 'deposit':
+        settlement = TELEBIRR_SETTLEMENT_ACCOUNT or 'N/A'
+        await query.edit_message_text(
+            f"💸 ገንዘብ ለማስገባት ወደዚህ Telebirr ሂሳብ ይላኩ:\n\n"
+            f"📞 {settlement}\n\n"
+            f"ከዚያም በሚከተለው ቅርጸት የግብይት ቁጥሩን ይላኩ:\n"
+            f"/deposit <amount> <transaction_id>\n\n"
+            f"ለምሳሌ: /deposit 100 DET8FJGUJ4"
+        )
+
+    elif data == 'withdraw':
+        await query.edit_message_text(
+            "እባክዎ የመውጣት ጥያቄውን በሚከተለው ቅርጸት ይላኩ:\n\n"
+            "/withdraw <amount> <phone_number>\n\n"
+            "ለምሳሌ: /withdraw 50 0911223344"
+        )
+
+    elif data == 'referral':
+        await query.edit_message_text("የማጣቀሻ ሊንክዎን ለማግኘት በቅርቡ ይገኛል።")
+
+    elif data == 'support':
+        await query.edit_message_text("ለእገዛ እባክዎ @YourSupportUsername ያነጋግሩ።")
+
+async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text("ትክክለኛ ቅርጸት: /deposit <amount> <transaction_id>")
+            return
+        amount = float(args[0])
+        transaction_id = args[1]
+        telegram_id = str(update.effective_user.id)
+
+        conn = get_db()
+        player = conn.execute('SELECT * FROM players WHERE telegram_id = ?', (telegram_id,)).fetchone()
+        conn.close()
+        if not player:
+            await update.message.reply_text("በመጀመሪያ ጨዋታውን ይክፈቱ።")
+            return
+
+        is_valid, verified_amount = verify_telebirr_transaction(transaction_id)
+        if not is_valid:
+            await update.message.reply_text("ግብይቱ አልተረጋገጠም።")
+            return
+        if verified_amount is not None and float(verified_amount) < amount:
+            await update.message.reply_text("የገንዘብ መጠኑ ከተረጋገጠው ጋር አይዛመድም።")
+            return
+
+        conn = get_db()
+        conn.execute('UPDATE players SET balance = balance + ? WHERE id = ?', (amount, player['id']))
+        conn.execute('INSERT INTO transactions (player_id, type, amount, status, reference) VALUES (?,?,?,?,?)',
+                     (player['id'], 'deposit', amount, 'completed', transaction_id))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(f"✅ ገንዘቡ በተሳካ ሁኔታ ገብቷል! አዲስ ቀሪ ሂሳብ: {get_player_balance(player['id']):.2f} ETB")
+    except Exception as e:
+        await update.message.reply_text(f"ስህተት: {str(e)}")
+
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = context.args
+        if len(args) < 2:
+            await update.message.reply_text("ትክክለኛ ቅርጸት: /withdraw <amount> <phone_number>")
+            return
+        amount = float(args[0])
+        phone = args[1]
+        telegram_id = str(update.effective_user.id)
+
+        conn = get_db()
+        player = conn.execute('SELECT * FROM players WHERE telegram_id = ?', (telegram_id,)).fetchone()
+        if not player:
+            conn.close()
+            await update.message.reply_text("ተጫዋች አልተገኘም።")
+            return
+        if player['balance'] < amount:
+            conn.close()
+            await update.message.reply_text("በቂ ቀሪ ሂሳብ የለም።")
+            return
+
+        conn.execute('UPDATE players SET balance = balance - ? WHERE id = ?', (amount, player['id']))
+        conn.execute('INSERT INTO withdrawal_requests (player_id, amount, method, phone_number) VALUES (?,?,?,?)',
+                     (player['id'], amount, 'Telebirr', phone))
+        conn.execute('INSERT INTO transactions (player_id, type, amount, status, reference) VALUES (?,?,?,?,?)',
+                     (player['id'], 'withdrawal', -amount, 'pending', 'Withdrawal request'))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text("✅ የመውጣት ጥያቄዎ ተልኳል። በቅርቡ ይገመገማል።")
+    except Exception as e:
+        await update.message.reply_text(f"ስህተት: {str(e)}")
+
+def run_bot():
+    if not BOT_TOKEN:
+        print("BOT_TOKEN not set, bot will not start.")
+        return
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("deposit", deposit_command))
+    bot_app.add_handler(CommandHandler("withdraw", withdraw_command))
+    bot_app.add_handler(CallbackQueryHandler(button_handler))
+    bot_app.run_polling()
+
+# ========== تشغيل ==========
 if __name__ == '__main__':
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
