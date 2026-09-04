@@ -473,6 +473,9 @@ if BOT_TOKEN:
     bot_app.add_handler(CommandHandler("deposit", deposit_command))
     bot_app.add_handler(CommandHandler("withdraw", withdraw_command))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
+
+    # تهيئة التطبيق (مطلوبة في python-telegram-bot v22)
+    asyncio.run(bot_app.initialize())
 else:
     print("BOT_TOKEN not set — Telegram bot will not start.")
 
