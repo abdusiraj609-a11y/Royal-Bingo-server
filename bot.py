@@ -93,8 +93,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("royal-bingo")
+
 app = Flask(__name__)
 
+CARTELA_PRICE = 10.0
+CARTELA_PRIZE_POOL = 8.0
 # ============================================================
 # DATABASE
 # ============================================================
