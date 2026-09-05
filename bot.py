@@ -1,19 +1,18 @@
 """
-ROYAL BINGO — Server (Bot + Game API)
-=====================================
+ROYAL BINGO — Server (Bot + Game API), واحد فقط يشغّل كل شيء
+================================================================
+هذا الملف يجمع 3 أشياء تعمل معًا في نفس العملية (Process) وتتشارك نفس قاعدة البيانات:
 
-ملف واحد يشغّل:
-1. Telegram Bot
-2. Round Engine
-3. Flask Game API
+1. بوت تيليغرام (إيداع / سحب / رصيد / دعم).
+2. محرك الجولة الجماعية (Round Engine).
+3. واجهة API (Flask) لصفحة اللعبة.
 
-القواعد:
-- أول Bingo يوقف الجولة فورًا.
-- جميع اللاعبين في الجولة يرون نفس تسلسل الكرات.
-- Prize Pool = 80% من مجموع Entry Stake المدفوع في الجولة.
-- عند التعادل في نفس الكرة، يتم تقسيم Prize Pool بالتساوي بين
-  جميع الكرتيلات الفائزة.
-- الرصيد والنتيجة والفوز يقررها السيرفر فقط.
+القاعدة الاقتصادية:
+- الفوز يحدث عند أول BINGO فقط.
+- عند أول BINGO تتوقف الجولة فورًا.
+- Prize Pool = 80% من إجمالي Entry Stake.
+- إذا فاز أكثر من لاعب على نفس الكرة، يتم تقسيم الجائزة بينهم بالتساوي.
+- السيرفر هو المصدر الوحيد للحقيقة بالنسبة للرصيد والفوز.
 """
 
 import os
@@ -25,12 +24,14 @@ import hashlib
 import logging
 import threading
 import urllib.parse
+from datetime import datetime
 import asyncio
+import base64
+import binascii
 import uuid
+
 import requests
 import sqlite3
-
-from datetime import datetime
 
 from flask import Flask, request, jsonify
 
@@ -54,21 +55,16 @@ from telegram.ext import (
     filters,
 )
 
-
-# ============================================================
-# LOGGING
-# ============================================================
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 log = logging.getLogger("royal_bingo_server")
 
 
 # ============================================================
-# SETTINGS
+# الإعدادات
 # ============================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -92,13 +88,8 @@ SUPPORT_CONTACT = os.environ.get(
 )
 
 PORT = int(
-    os.environ.get("PORT", "5000")
+    os.environ.get("PORT", 5000)
 )
-
-
-# ============================================================
-# TELEBIRR / DEPOSIT SETTINGS
-# ============================================================
 
 DEPOSIT_METHOD = "Telebirr"
 
@@ -108,7 +99,7 @@ DEPOSIT_ACCOUNT_NUMBER = "0993946560"
 
 
 # ============================================================
-# VERIFY.ET
+# Verify.ET
 # ============================================================
 
 VERIFY_ET_API_KEY = os.environ.get(
@@ -119,12 +110,15 @@ VERIFY_ET_API_KEY = os.environ.get(
 VERIFY_ET_BASE_URL = "https://verify.et"
 
 VERIFY_ET_WAIT_MS = int(
-    os.environ.get("VERIFY_ET_WAIT_MS", "8000")
+    os.environ.get(
+        "VERIFY_ET_WAIT_MS",
+        "8000"
+    )
 )
 
 
 # ============================================================
-# DATABASE
+# قاعدة البيانات
 # ============================================================
 
 DB_PATH = os.environ.get(
@@ -133,60 +127,72 @@ DB_PATH = os.environ.get(
 )
 
 
+# ============================================================
+# اقتصاد الجولة
+# ============================================================
+
+ENTRY_STAKE = int(
+    os.environ.get(
+        "ENTRY_STAKE",
+        "10"
+    )
+)
+
+MAX_CARTELAS = int(
+    os.environ.get(
+        "MAX_CARTELAS",
+        "4"
+    )
+)
+
+COLLECT_SECONDS = int(
+    os.environ.get(
+        "COLLECT_SECONDS",
+        "45"
+    )
+)
+
+BALL_DRAW_SECONDS = float(
+    os.environ.get(
+        "BALL_DRAW_SECONDS",
+        "2.0"
+    )
+)
+
+PAYOUT_RATIO = float(
+    os.environ.get(
+        "PAYOUT_RATIO",
+        "0.80"
+    )
+)
+
+
+# ============================================================
+# Conversation states
+# ============================================================
+
+DEP_AMOUNT, DEP_TXNID, DEP_SCREENSHOT = range(3)
+
+WD_AMOUNT, WD_PHONE = range(3, 5)
+
+
+# ============================================================
+# SQLite
+# ============================================================
+
 _db_lock = threading.Lock()
 
 
 def db():
     conn = sqlite3.connect(
         DB_PATH,
-        timeout=30,
-        check_same_thread=False,
+        timeout=10
     )
 
     conn.row_factory = sqlite3.Row
 
     return conn
 
-
-# ============================================================
-# GAME ECONOMY
-# ============================================================
-
-ENTRY_STAKE = int(
-    os.environ.get("ENTRY_STAKE", "10")
-)
-
-MAX_CARTELAS = int(
-    os.environ.get("MAX_CARTELAS", "4")
-)
-
-COLLECT_SECONDS = int(
-    os.environ.get("COLLECT_SECONDS", "45")
-)
-
-BALL_DRAW_SECONDS = float(
-    os.environ.get("BALL_DRAW_SECONDS", "2.0")
-)
-
-PAYOUT_RATIO = float(
-    os.environ.get("PAYOUT_RATIO", "0.80")
-)
-
-
-# ============================================================
-# CONVERSATION STATES
-# ============================================================
-
-DEP_AMOUNT = 1
-DEP_TXNID = 2
-
-WD_AMOUNT = 3
-WD_PHONE = 4
-
-
-# ============================================================
-# DATABASE INITIALIZATION
-# ============================================================
 
 def init_db():
 
@@ -253,36 +259,17 @@ def init_db():
 
     conn.commit()
 
-    # --------------------------------------------------------
-    # منع تكرار Transaction ID
-    # --------------------------------------------------------
-
-    try:
-        conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_deposits_txn_id_unique
-            ON deposits(txn_id)
-            WHERE txn_id IS NOT NULL
-              AND txn_id != ''
-        """)
-
-        conn.commit()
-
-    except sqlite3.IntegrityError:
-
-        log.exception(
-            "Could not create unique transaction index. "
-            "Existing duplicate txn_id values may exist."
-        )
-
     conn.close()
 
 
 # ============================================================
-# USERS / BALANCE
+# المستخدمون / الرصيد
 # ============================================================
 
-def get_or_create_user(user_id: int, username: str) -> int:
+def get_or_create_user(
+    user_id: int,
+    username: str
+) -> int:
 
     conn = db()
 
@@ -295,12 +282,16 @@ def get_or_create_user(user_id: int, username: str) -> int:
 
         conn.execute(
             """
-            INSERT INTO users(user_id, username, balance)
-            VALUES (?, ?, 0)
+            INSERT INTO users(
+                user_id,
+                username,
+                balance
+            )
+            VALUES (?,?,0)
             """,
             (
                 user_id,
-                username or "",
+                username or ""
             )
         )
 
@@ -311,14 +302,10 @@ def get_or_create_user(user_id: int, username: str) -> int:
     else:
 
         conn.execute(
-            """
-            UPDATE users
-            SET username=?
-            WHERE user_id=?
-            """,
+            "UPDATE users SET username=? WHERE user_id=?",
             (
                 username or "",
-                user_id,
+                user_id
             )
         )
 
@@ -342,42 +329,61 @@ def get_balance(user_id: int) -> int:
 
     conn.close()
 
-    if row is None:
-        return 0
+    return row["balance"] if row else 0
 
-    return int(row["balance"])
+
+def change_balance(
+    user_id: int,
+    delta: int
+):
+
+    conn = db()
+
+    conn.execute(
+        """
+        UPDATE users
+        SET balance = balance + ?
+        WHERE user_id=?
+        """,
+        (
+            delta,
+            user_id
+        )
+    )
+
+    conn.commit()
+
+    conn.close()
 
 
 # ============================================================
-# TELEBIRR VERIFICATION
+# Verify.ET
 # ============================================================
 
-def verify_telebirr_payment(transaction_number: str):
+def verify_telebirr_payment(
+    transaction_number: str
+):
 
     if not VERIFY_ET_API_KEY:
 
         return {
             "ok": False,
             "reason": "verify_not_configured",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     headers = {
         "Content-Type": "application/json",
         "x-api-key": VERIFY_ET_API_KEY,
-        "Idempotency-Key": (
-            f"royal-bingo-{uuid.uuid4()}"
-        ),
+        "Idempotency-Key":
+            f"royal-bingo-{uuid.uuid4()}",
     }
-
 
     body = {
         "bank": "telebirr",
         "transactionNumber": transaction_number,
         "settlementAccount": DEPOSIT_ACCOUNT_NUMBER,
     }
-
 
     try:
 
@@ -386,7 +392,7 @@ def verify_telebirr_payment(transaction_number: str):
             f"?waitMs={VERIFY_ET_WAIT_MS}",
             json=body,
             headers=headers,
-            timeout=(VERIFY_ET_WAIT_MS / 1000) + 5,
+            timeout=(VERIFY_ET_WAIT_MS / 1000) + 5
         )
 
     except requests.RequestException as e:
@@ -399,68 +405,62 @@ def verify_telebirr_payment(transaction_number: str):
         return {
             "ok": False,
             "reason": "network_error",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     if resp.status_code == 202:
 
         return {
             "ok": False,
             "reason": "still_processing",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     if resp.status_code == 401:
 
         log.error(
-            "Verify.ET invalid API key!"
+            "Verify.ET: invalid API key!"
         )
 
         return {
             "ok": False,
             "reason": "verify_misconfigured",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     if resp.status_code == 402:
 
         log.error(
-            "Verify.ET verification credits exhausted!"
+            "Verify.ET: verification credits exhausted!"
         )
 
         return {
             "ok": False,
             "reason": "verify_credits_exhausted",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     if resp.status_code == 429:
 
         return {
             "ok": False,
             "reason": "rate_limited",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     if resp.status_code != 200:
 
         log.warning(
             "Verify.ET unexpected status %s: %s",
             resp.status_code,
-            resp.text[:300],
+            resp.text[:300]
         )
 
         return {
             "ok": False,
             "reason": f"http_{resp.status_code}",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     try:
 
@@ -471,18 +471,16 @@ def verify_telebirr_payment(transaction_number: str):
         return {
             "ok": False,
             "reason": "bad_response",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     if not payload.get("success"):
 
         return {
             "ok": False,
             "reason": "verify_failed",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
-
 
     items = payload.get("data") or []
 
@@ -491,41 +489,35 @@ def verify_telebirr_payment(transaction_number: str):
         return {
             "ok": False,
             "reason": "no_data",
-            "fallback_to_manual": True,
+            "fallback_to_manual": True
         }
 
-
     item = items[0]
-
 
     if not item.get("verified"):
 
         return {
             "ok": False,
             "reason": "not_verified",
-            "fallback_to_manual": False,
+            "fallback_to_manual": False
         }
-
 
     confirmation = (
         item.get("confirmationHistory")
         or {}
     )
 
-
     if confirmation.get("confirmedBefore"):
 
         return {
             "ok": False,
             "reason": "duplicate_transaction",
-            "fallback_to_manual": False,
+            "fallback_to_manual": False
         }
 
-
-    settlement_match = (
-        item.get("settlementAccountMatch")
+    settlement_match = item.get(
+        "settlementAccountMatch"
     )
-
 
     if (
         settlement_match
@@ -535,60 +527,27 @@ def verify_telebirr_payment(transaction_number: str):
         return {
             "ok": False,
             "reason": "wrong_recipient",
-            "fallback_to_manual": False,
+            "fallback_to_manual": False
         }
-
-
-    amount = item.get("amount")
-
-    if amount is None:
-
-        return {
-            "ok": False,
-            "reason": "missing_verified_amount",
-            "fallback_to_manual": False,
-        }
-
-
-    try:
-
-        verified_amount = int(amount)
-
-    except (TypeError, ValueError):
-
-        return {
-            "ok": False,
-            "reason": "invalid_verified_amount",
-            "fallback_to_manual": False,
-        }
-
-
-    if verified_amount <= 0:
-
-        return {
-            "ok": False,
-            "reason": "invalid_verified_amount",
-            "fallback_to_manual": False,
-        }
-
 
     return {
         "ok": True,
-        "amount": verified_amount,
+        "amount": item.get("amount"),
         "sender_name": item.get("senderName"),
-        "reference": (
+        "reference":
             item.get("referenceNumber")
             or item.get("transactionNumber")
-            or transaction_number
-        ),
+            or transaction_number,
     }
 
 
 # ============================================================
-# TELEGRAM INIT DATA VALIDATION
+# Telegram initData validation
 # ============================================================
 
-def validate_init_data(init_data: str):
+def validate_init_data(
+    init_data: str
+):
 
     try:
 
@@ -607,52 +566,30 @@ def validate_init_data(init_data: str):
         if not received_hash:
             return None
 
-
         data_check_string = "\n".join(
             f"{k}={v}"
-            for k, v in sorted(parsed.items())
+            for k, v in sorted(
+                parsed.items()
+            )
         )
-
 
         secret_key = hmac.new(
             b"WebAppData",
             BOT_TOKEN.encode(),
-            hashlib.sha256,
+            hashlib.sha256
         ).digest()
-
 
         computed_hash = hmac.new(
             secret_key,
             data_check_string.encode(),
-            hashlib.sha256,
+            hashlib.sha256
         ).hexdigest()
-
 
         if not hmac.compare_digest(
             computed_hash,
             received_hash
         ):
             return None
-
-
-        # ----------------------------------------------------
-        # حماية من Replay Attack
-        # ----------------------------------------------------
-
-        auth_date = parsed.get("auth_date")
-
-        if not auth_date:
-            return None
-
-        try:
-            auth_timestamp = int(auth_date)
-        except ValueError:
-            return None
-
-        # البيانات القديمة جدًا ترفض
-        if abs(time.time() - auth_timestamp) > 86400:
-            return None
-
 
         user = json.loads(
             parsed.get(
@@ -661,10 +598,8 @@ def validate_init_data(init_data: str):
             )
         )
 
-
         if "id" not in user:
             return None
-
 
         return user
 
@@ -674,7 +609,7 @@ def validate_init_data(init_data: str):
 
 
 # ============================================================
-# BINGO ENGINE
+# Round Engine
 # ============================================================
 
 COLUMN_RANGES = {
@@ -692,31 +627,28 @@ def generate_grid():
 
     for letter, (lo, hi) in COLUMN_RANGES.items():
 
-        need = (
-            4
-            if letter == "N"
-            else 5
-        )
+        need = 4 if letter == "N" else 5
 
         cols[letter] = random.sample(
             range(lo, hi + 1),
             need
         )
 
-
     grid = []
-
 
     for row in range(5):
 
         line = []
 
-        for letter in ["B", "I", "N", "G", "O"]:
+        for letter in [
+            "B",
+            "I",
+            "N",
+            "G",
+            "O"
+        ]:
 
-            if (
-                letter == "N"
-                and row == 2
-            ):
+            if letter == "N" and row == 2:
 
                 line.append("FREE")
 
@@ -724,7 +656,10 @@ def generate_grid():
 
                 idx = (
                     row - 1
-                    if letter == "N" and row > 2
+                    if (
+                        letter == "N"
+                        and row > 2
+                    )
                     else row
                 )
 
@@ -734,23 +669,18 @@ def generate_grid():
 
         grid.append(line)
 
-
     return grid
 
 
-def check_grid_win(grid, called_set):
+def check_grid_win(
+    grid,
+    called_set
+):
 
-    def marked(r, c):
-
-        value = grid[r][c]
-
-        return (
-            value == "FREE"
-            or value in called_set
-        )
-
-
-    # rows
+    marked = lambda r, c: (
+        grid[r][c] == "FREE"
+        or grid[r][c] in called_set
+    )
 
     for r in range(5):
 
@@ -760,9 +690,6 @@ def check_grid_win(grid, called_set):
         ):
             return True
 
-
-    # columns
-
     for c in range(5):
 
         if all(
@@ -771,17 +698,11 @@ def check_grid_win(grid, called_set):
         ):
             return True
 
-
-    # diagonal
-
     if all(
         marked(i, i)
         for i in range(5)
     ):
         return True
-
-
-    # reverse diagonal
 
     if all(
         marked(i, 4 - i)
@@ -789,13 +710,8 @@ def check_grid_win(grid, called_set):
     ):
         return True
 
-
     return False
 
-
-# ============================================================
-# ROUND MANAGEMENT
-# ============================================================
 
 def get_or_create_active_round():
 
@@ -805,12 +721,11 @@ def get_or_create_active_round():
         """
         SELECT *
         FROM rounds
-        WHERE status IN ('collecting', 'active')
+        WHERE status IN ('collecting','active')
         ORDER BY id DESC
         LIMIT 1
         """
     ).fetchone()
-
 
     if row is None:
 
@@ -818,7 +733,6 @@ def get_or_create_active_round():
             time.time()
             + COLLECT_SECONDS
         )
-
 
         conn.execute(
             """
@@ -839,13 +753,11 @@ def get_or_create_active_round():
             """,
             (
                 close_at,
-                datetime.utcnow().isoformat(),
+                datetime.utcnow().isoformat()
             )
         )
 
-
         conn.commit()
-
 
         row = conn.execute(
             """
@@ -856,15 +768,10 @@ def get_or_create_active_round():
             """
         ).fetchone()
 
-
     conn.close()
 
     return row
 
-
-# ============================================================
-# ROUND ENGINE TICK
-# ============================================================
 
 def round_engine_tick():
 
@@ -876,27 +783,22 @@ def round_engine_tick():
             """
             SELECT *
             FROM rounds
-            WHERE status IN ('collecting', 'active')
+            WHERE status IN ('collecting','active')
             ORDER BY id DESC
             LIMIT 1
             """
         ).fetchone()
 
-
         now = time.time()
-
 
         if rnd is None:
 
             conn.close()
 
-            get_or_create_active_round()
-
             return
 
-
         # ====================================================
-        # 1. CLOSE COLLECTION
+        # انتهاء وقت التجميع
         # ====================================================
 
         if (
@@ -909,7 +811,6 @@ def round_engine_tick():
             )
 
             random.shuffle(sequence)
-
 
             conn.execute(
                 """
@@ -925,26 +826,18 @@ def round_engine_tick():
                     json.dumps(sequence),
                     now,
                     now,
-                    rnd["id"],
+                    rnd["id"]
                 )
             )
-
 
             conn.commit()
 
             conn.close()
 
-            log.info(
-                "Round %s started. Prize pool: %s ETB",
-                rnd["id"],
-                rnd["prize_pool"],
-            )
-
             return
 
-
         # ====================================================
-        # 2. DRAW NEXT BALL
+        # الجولة النشطة
         # ====================================================
 
         if (
@@ -960,47 +853,21 @@ def round_engine_tick():
                 rnd["called_balls"]
             )
 
-
             if len(called) >= 75:
-
-                conn.execute(
-                    """
-                    UPDATE rounds
-                    SET
-                        status='finished',
-                        finished_at=?
-                    WHERE id=?
-                    """,
-                    (
-                        now,
-                        rnd["id"],
-                    )
-                )
-
-                conn.commit()
 
                 conn.close()
 
-                get_or_create_active_round()
-
                 return
-
 
             next_ball = sequence[
                 len(called)
             ]
 
-            called.append(next_ball)
-
-            called_set = set(called)
-
-
-            log.info(
-                "Round %s ball: %s",
-                rnd["id"],
-                next_ball,
+            called.append(
+                next_ball
             )
 
+            called_set = set(called)
 
             entries = conn.execute(
                 """
@@ -1011,52 +878,28 @@ def round_engine_tick():
                 (rnd["id"],)
             ).fetchall()
 
-
-            winners = []
-
-
-            for entry in entries:
-
-                grid = json.loads(
-                    entry["grid"]
-                )
-
+            winners = [
+                e
+                for e in entries
                 if check_grid_win(
-                    grid,
+                    json.loads(e["grid"]),
                     called_set
-                ):
-
-                    winners.append(entry)
-
+                )
+            ]
 
             # =================================================
-            # FIRST BINGO
+            # أول BINGO
             # =================================================
 
             if winners:
 
-                pool = int(
-                    rnd["prize_pool"]
-                )
-
+                pool = rnd["prize_pool"]
 
                 share = (
                     pool // len(winners)
                     if winners
                     else 0
                 )
-
-
-                log.info(
-                    "Round %s FINISHED. "
-                    "Ball=%s Winners=%s Pool=%s Share=%s",
-                    rnd["id"],
-                    next_ball,
-                    len(winners),
-                    pool,
-                    share,
-                )
-
 
                 for winner in winners:
 
@@ -1070,10 +913,9 @@ def round_engine_tick():
                         """,
                         (
                             share,
-                            winner["id"],
+                            winner["id"]
                         )
                     )
-
 
                     conn.execute(
                         """
@@ -1083,10 +925,9 @@ def round_engine_tick():
                         """,
                         (
                             share,
-                            winner["user_id"],
+                            winner["user_id"]
                         )
                     )
-
 
                 conn.execute(
                     """
@@ -1100,24 +941,20 @@ def round_engine_tick():
                     (
                         json.dumps(called),
                         now,
-                        rnd["id"],
+                        rnd["id"]
                     )
                 )
-
 
                 conn.commit()
 
                 conn.close()
 
-
-                # الجولة التالية
                 get_or_create_active_round()
 
                 return
 
-
             # =================================================
-            # NO WINNER YET
+            # جميع الكرات انتهت
             # =================================================
 
             if len(called) >= 75:
@@ -1134,10 +971,9 @@ def round_engine_tick():
                     (
                         json.dumps(called),
                         now,
-                        rnd["id"],
+                        rnd["id"]
                     )
                 )
-
 
                 conn.commit()
 
@@ -1147,9 +983,8 @@ def round_engine_tick():
 
                 return
 
-
             # =================================================
-            # CONTINUE
+            # الكرة التالية
             # =================================================
 
             conn.execute(
@@ -1163,10 +998,9 @@ def round_engine_tick():
                 (
                     json.dumps(called),
                     now + BALL_DRAW_SECONDS,
-                    rnd["id"],
+                    rnd["id"]
                 )
             )
-
 
             conn.commit()
 
@@ -1174,20 +1008,14 @@ def round_engine_tick():
 
             return
 
-
         conn.close()
 
-
-# ============================================================
-# ROUND LOOP
-# ============================================================
 
 def round_engine_loop():
 
     log.info(
-        "Royal Bingo Round Engine started."
+        "Round engine started."
     )
-
 
     while True:
 
@@ -1202,12 +1030,11 @@ def round_engine_loop():
                 e
             )
 
-
         time.sleep(1)
 
 
 # ============================================================
-# FLASK
+# Flask API
 # ============================================================
 
 app = Flask(__name__)
@@ -1218,7 +1045,7 @@ app.config[
 
 
 # ============================================================
-# RAW TELEGRAM BOT
+# Raw Telegram Bot
 # ============================================================
 
 _raw_bot = Bot(
@@ -1235,7 +1062,23 @@ def send_admin_message_sync(
         _raw_bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=text,
-            reply_markup=reply_markup,
+            reply_markup=reply_markup
+        )
+    )
+
+
+def send_admin_photo_sync(
+    photo_bytes,
+    caption,
+    reply_markup=None
+):
+
+    return asyncio.run(
+        _raw_bot.send_photo(
+            chat_id=ADMIN_CHAT_ID,
+            photo=photo_bytes,
+            caption=caption,
+            reply_markup=reply_markup
         )
     )
 
@@ -1250,14 +1093,15 @@ def send_user_message_sync(
         asyncio.run(
             _raw_bot.send_message(
                 chat_id=user_id,
-                text=text,
+                text=text
             )
         )
 
     except Exception as e:
 
         log.warning(
-            "send_user_message_sync failed: %s",
+            "send_user_message_sync failed for %s: %s",
+            user_id,
             e
         )
 
@@ -1294,7 +1138,7 @@ def cors_preflight(_any):
 
 
 # ============================================================
-# AUTH
+# Authentication
 # ============================================================
 
 def auth_or_error(payload):
@@ -1306,19 +1150,15 @@ def auth_or_error(payload):
         )
     )
 
-
     if user is None:
 
         return None, (
-            jsonify(
-                {
-                    "error":
+            jsonify({
+                "error":
                     "invalid_init_data"
-                }
-            ),
-            401,
+            }),
+            401
         )
-
 
     return user, None
 
@@ -1344,26 +1184,21 @@ def api_auth():
     if err:
         return err
 
-
     balance = get_or_create_user(
         user["id"],
         user.get("username")
     )
 
-
-    return jsonify(
-        {
-            "user_id": user["id"],
-            "username": user.get(
-                "username"
-            ),
-            "balance": balance,
-        }
-    )
+    return jsonify({
+        "user_id": user["id"],
+        "username":
+            user.get("username"),
+        "balance": balance
+    })
 
 
 # ============================================================
-# PUBLIC ROUND STATE
+# Public round data
 # ============================================================
 
 def round_to_public_dict(
@@ -1373,16 +1208,15 @@ def round_to_public_dict(
 
     now = time.time()
 
-
     out = {
         "round_id": rnd["id"],
         "status": rnd["status"],
         "prize_pool": rnd["prize_pool"],
-        "called_balls": json.loads(
-            rnd["called_balls"]
-        ),
+        "called_balls":
+            json.loads(
+                rnd["called_balls"]
+            ),
     }
-
 
     if rnd["status"] == "collecting":
 
@@ -1393,28 +1227,25 @@ def round_to_public_dict(
             )
         )
 
-
     if entries_for_user is not None:
 
         out["your_entries"] = [
             {
-                "grid": json.loads(
-                    e["grid"]
-                ),
-                "is_winner": bool(
-                    e["is_winner"]
-                ),
-                "payout": e["payout"],
+                "grid":
+                    json.loads(e["grid"]),
+                "is_winner":
+                    bool(e["is_winner"]),
+                "payout":
+                    e["payout"]
             }
             for e in entries_for_user
         ]
-
 
     return out
 
 
 # ============================================================
-# CURRENT ROUND
+# Current round
 # ============================================================
 
 @app.route(
@@ -1434,9 +1265,7 @@ def api_round_current():
     if err:
         return err
 
-
     rnd = get_or_create_active_round()
-
 
     conn = db()
 
@@ -1445,17 +1274,15 @@ def api_round_current():
         SELECT *
         FROM round_entries
         WHERE round_id=?
-          AND user_id=?
+        AND user_id=?
         """,
         (
             rnd["id"],
-            user["id"],
+            user["id"]
         )
     ).fetchall()
 
-
     conn.close()
-
 
     return jsonify(
         round_to_public_dict(
@@ -1466,7 +1293,7 @@ def api_round_current():
 
 
 # ============================================================
-# JOIN ROUND
+# Join round
 # ============================================================
 
 @app.route(
@@ -1486,52 +1313,23 @@ def api_round_join():
     if err:
         return err
 
-
-    try:
-
-        count = int(
-            payload.get(
-                "count",
-                1
-            )
+    count = int(
+        payload.get(
+            "count",
+            1
         )
+    )
 
-    except (TypeError, ValueError):
+    if count <= 0:
 
-        return jsonify(
-            {
-                "error":
+        return jsonify({
+            "error":
                 "invalid_count"
-            }
-        ), 400
-
-
-    if count < 1:
-
-        return jsonify(
-            {
-                "error":
-                "invalid_count"
-            }
-        ), 400
-
-
-    if count > MAX_CARTELAS:
-
-        return jsonify(
-            {
-                "error":
-                "max_cartelas_exceeded",
-                "max":
-                MAX_CARTELAS,
-            }
-        ), 400
-
+        }), 400
 
     with _db_lock:
 
         conn = db()
-
 
         rnd = conn.execute(
             """
@@ -1543,69 +1341,47 @@ def api_round_join():
             """
         ).fetchone()
 
-
         if rnd is None:
 
             conn.close()
 
-            return jsonify(
-                {
-                    "error":
+            return jsonify({
+                "error":
                     "no_open_round"
-                }
-            ), 400
-
-
-        # ----------------------------------------------------
-        # تأكد أن نافذة الانضمام لم تنته فعليًا
-        # ----------------------------------------------------
-
-        if time.time() >= rnd["close_at"]:
-
-            conn.close()
-
-            return jsonify(
-                {
-                    "error":
-                    "round_closing"
-                }
-            ), 400
-
+            }), 400
 
         existing = conn.execute(
             """
-            SELECT COUNT(*) AS c
+            SELECT COUNT(*) c
             FROM round_entries
             WHERE round_id=?
-              AND user_id=?
+            AND user_id=?
             """,
             (
                 rnd["id"],
-                user["id"],
+                user["id"]
             )
         ).fetchone()["c"]
 
-
-        if existing + count > MAX_CARTELAS:
+        if (
+            existing + count
+            > MAX_CARTELAS
+        ):
 
             conn.close()
 
-            return jsonify(
-                {
-                    "error":
+            return jsonify({
+                "error":
                     "max_cartelas_exceeded",
-                    "max":
+                "max":
                     MAX_CARTELAS,
-                    "already":
-                    existing,
-                }
-            ), 400
-
+                "already":
+                    existing
+            }), 400
 
         cost = (
             ENTRY_STAKE * count
         )
-
 
         bal_row = conn.execute(
             """
@@ -1616,33 +1392,24 @@ def api_round_join():
             (user["id"],)
         ).fetchone()
 
-
         balance = (
             bal_row["balance"]
             if bal_row
             else 0
         )
 
-
         if balance < cost:
 
             conn.close()
 
-            return jsonify(
-                {
-                    "error":
+            return jsonify({
+                "error":
                     "insufficient_balance",
-                    "balance":
+                "balance":
                     balance,
-                    "needed":
-                    cost,
-                }
-            ), 400
-
-
-        # ----------------------------------------------------
-        # الخصم
-        # ----------------------------------------------------
+                "needed":
+                    cost
+            }), 400
 
         conn.execute(
             """
@@ -1652,19 +1419,13 @@ def api_round_join():
             """,
             (
                 cost,
-                user["id"],
+                user["id"]
             )
         )
 
-
-        # ----------------------------------------------------
-        # 80% Prize Pool
-        # ----------------------------------------------------
-
-        pool_add = int(
+        pool_add = round(
             cost * PAYOUT_RATIO
         )
-
 
         conn.execute(
             """
@@ -1675,18 +1436,15 @@ def api_round_join():
             """,
             (
                 pool_add,
-                rnd["id"],
+                rnd["id"]
             )
         )
 
-
         new_grids = []
-
 
         for _ in range(count):
 
             grid = generate_grid()
-
 
             conn.execute(
                 """
@@ -1697,46 +1455,36 @@ def api_round_join():
                     grid,
                     stake_paid
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?,?,?,?,?)
                 """,
                 (
                     rnd["id"],
                     user["id"],
-                    user.get(
-                        "username"
-                    ),
+                    user.get("username"),
                     json.dumps(grid),
-                    ENTRY_STAKE,
+                    ENTRY_STAKE
                 )
             )
 
-
             new_grids.append(grid)
 
-
         conn.commit()
-
 
         new_balance = (
             balance - cost
         )
 
-
         conn.close()
 
-
-    return jsonify(
-        {
-            "ok": True,
-            "grids": new_grids,
-            "balance": new_balance,
-            "round_id": rnd["id"],
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "grids": new_grids,
+        "balance": new_balance
+    })
 
 
 # ============================================================
-# ROUND STATE
+# Round state
 # ============================================================
 
 @app.route(
@@ -1756,27 +1504,13 @@ def api_round_state():
     if err:
         return err
 
-
-    try:
-
-        round_id = int(
-            payload.get(
-                "round_id"
-            )
+    round_id = int(
+        payload.get(
+            "round_id"
         )
-
-    except (TypeError, ValueError):
-
-        return jsonify(
-            {
-                "error":
-                "invalid_round_id"
-            }
-        ), 400
-
+    )
 
     conn = db()
-
 
     rnd = conn.execute(
         """
@@ -1787,67 +1521,46 @@ def api_round_state():
         (round_id,)
     ).fetchone()
 
-
     if rnd is None:
 
         conn.close()
 
-        return jsonify(
-            {
-                "error":
+        return jsonify({
+            "error":
                 "round_not_found"
-            }
-        ), 404
-
+        }), 404
 
     entries = conn.execute(
         """
         SELECT *
         FROM round_entries
         WHERE round_id=?
-          AND user_id=?
+        AND user_id=?
         """,
         (
             round_id,
-            user["id"],
+            user["id"]
         )
     ).fetchall()
 
-
-    balance_row = conn.execute(
-        """
-        SELECT balance
-        FROM users
-        WHERE user_id=?
-        """,
-        (user["id"],)
-    ).fetchone()
-
-
-    balance = (
-        balance_row["balance"]
-        if balance_row
-        else 0
+    balance = get_balance(
+        user["id"]
     )
 
-
     conn.close()
-
 
     result = round_to_public_dict(
         rnd,
         entries
     )
 
-
     result["balance"] = balance
-
 
     return jsonify(result)
 
 
 # ============================================================
-# DEPOSIT API
+# Deposit API
 # ============================================================
 
 @app.route(
@@ -1867,7 +1580,6 @@ def api_deposit_submit():
     if err:
         return err
 
-
     txn_id = str(
         payload.get(
             "txn_id",
@@ -1875,16 +1587,12 @@ def api_deposit_submit():
         )
     ).strip()
 
-
     if not txn_id:
 
-        return jsonify(
-            {
-                "error":
+        return jsonify({
+            "error":
                 "missing_txn_id"
-            }
-        ), 400
-
+        }), 400
 
     try:
 
@@ -1895,65 +1603,16 @@ def api_deposit_submit():
             )
         )
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError
+    ):
 
         claimed_amount = 0
-
-
-    # --------------------------------------------------------
-    # تحقق محلي أولًا
-    # --------------------------------------------------------
-
-    with _db_lock:
-
-        conn = db()
-
-        existing = conn.execute(
-            """
-            SELECT *
-            FROM deposits
-            WHERE txn_id=?
-            LIMIT 1
-            """,
-            (txn_id,)
-        ).fetchone()
-
-        conn.close()
-
-
-    if existing:
-
-        if existing["status"] == "completed":
-
-            return jsonify(
-                {
-                    "error":
-                    "duplicate_transaction"
-                }
-            ), 400
-
-        return jsonify(
-            {
-                "error":
-                "transaction_already_submitted",
-                "status":
-                existing["status"],
-            }
-        ), 400
-
-
-    # --------------------------------------------------------
-    # Verify.ET
-    # --------------------------------------------------------
 
     result = verify_telebirr_payment(
         txn_id
     )
-
-
-    # ========================================================
-    # VERIFIED
-    # ========================================================
 
     if result["ok"]:
 
@@ -1961,176 +1620,7 @@ def api_deposit_submit():
             result["amount"]
         )
 
-
-        with _db_lock:
-
-            conn = db()
-
-            # فحص نهائي ضد race condition
-            existing = conn.execute(
-                """
-                SELECT id
-                FROM deposits
-                WHERE txn_id=?
-                LIMIT 1
-                """,
-                (txn_id,)
-            ).fetchone()
-
-
-            if existing:
-
-                conn.close()
-
-                return jsonify(
-                    {
-                        "error":
-                        "duplicate_transaction"
-                    }
-                ), 400
-
-
-            cur = conn.execute(
-                """
-                INSERT INTO deposits(
-                    user_id,
-                    username,
-                    amount,
-                    method,
-                    txn_id,
-                    photo_file_id,
-                    status,
-                    created_at
-                )
-                VALUES (
-                    ?, ?, ?, ?, ?, ?, 'completed', ?
-                )
-                """,
-                (
-                    user["id"],
-                    user.get(
-                        "username",
-                        ""
-                    ),
-                    verified_amount,
-                    DEPOSIT_METHOD,
-                    txn_id,
-                    None,
-                    datetime.utcnow().isoformat(),
-                )
-            )
-
-
-            dep_id = cur.lastrowid
-
-
-            conn.execute(
-                """
-                UPDATE users
-                SET balance =
-                    balance + ?
-                WHERE user_id=?
-                """,
-                (
-                    verified_amount,
-                    user["id"],
-                )
-            )
-
-
-            balance_row = conn.execute(
-                """
-                SELECT balance
-                FROM users
-                WHERE user_id=?
-                """,
-                (user["id"],)
-            ).fetchone()
-
-
-            new_balance = (
-                balance_row["balance"]
-                if balance_row
-                else 0
-            )
-
-
-            conn.commit()
-
-            conn.close()
-
-
-        send_admin_message_sync(
-            f"✅ Auto-Verified Deposit #{dep_id}\n\n"
-            f"Player: @{user.get('username') or user['id']} "
-            f"(ID: {user['id']})\n"
-            f"Amount: {verified_amount} ETB\n"
-            f"Sender: {result.get('sender_name', '?')}\n"
-            f"Txn: {txn_id}\n\n"
-            f"Balance: {new_balance} ETB"
-        )
-
-
-        return jsonify(
-            {
-                "ok": True,
-                "status":
-                "completed",
-                "credited_amount":
-                verified_amount,
-                "balance":
-                new_balance,
-            }
-        )
-
-
-    # ========================================================
-    # HARD REJECT
-    # ========================================================
-
-    if not result.get(
-        "fallback_to_manual"
-    ):
-
-        return jsonify(
-            {
-                "error":
-                result["reason"]
-            }
-        ), 400
-
-
-    # ========================================================
-    # MANUAL FALLBACK
-    # ========================================================
-
-    with _db_lock:
-
         conn = db()
-
-
-        existing = conn.execute(
-            """
-            SELECT id
-            FROM deposits
-            WHERE txn_id=?
-            LIMIT 1
-            """,
-            (txn_id,)
-        ).fetchone()
-
-
-        if existing:
-
-            conn.close()
-
-            return jsonify(
-                {
-                    "error":
-                    "transaction_already_submitted"
-                }
-            ), 400
-
 
         cur = conn.execute(
             """
@@ -2145,7 +1635,14 @@ def api_deposit_submit():
                 created_at
             )
             VALUES (
-                ?, ?, ?, ?, ?, ?, 'pending', ?
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                'completed',
+                ?
             )
             """,
             (
@@ -2154,26 +1651,115 @@ def api_deposit_submit():
                     "username",
                     ""
                 ),
-                claimed_amount,
+                verified_amount,
                 DEPOSIT_METHOD,
                 txn_id,
                 None,
-                datetime.utcnow().isoformat(),
+                datetime.utcnow().isoformat()
             )
         )
 
-
         dep_id = cur.lastrowid
+
+        conn.execute(
+            """
+            UPDATE users
+            SET balance =
+                balance + ?
+            WHERE user_id=?
+            """,
+            (
+                verified_amount,
+                user["id"]
+            )
+        )
 
         conn.commit()
 
+        new_balance = get_balance(
+            user["id"]
+        )
+
         conn.close()
 
+        send_admin_message_sync(
+            f"✅ Auto-Verified Deposit #{dep_id}\n\n"
+            f"Player: @{user.get('username') or user['id']} "
+            f"(ID: {user['id']})\n"
+            f"Amount: {verified_amount} ETB "
+            f"(verified via Verify.ET)\n"
+            f"Sender: {result.get('sender_name','?')}\n"
+            f"Txn: {txn_id}\n\n"
+            f"Balance: {new_balance} ETB"
+        )
+
+        return jsonify({
+            "ok": True,
+            "status": "completed",
+            "credited_amount":
+                verified_amount,
+            "balance":
+                new_balance
+        })
+
+    if not result.get(
+        "fallback_to_manual"
+    ):
+
+        return jsonify({
+            "error":
+                result["reason"]
+        }), 400
+
+    conn = db()
+
+    cur = conn.execute(
+        """
+        INSERT INTO deposits(
+            user_id,
+            username,
+            amount,
+            method,
+            txn_id,
+            photo_file_id,
+            status,
+            created_at
+        )
+        VALUES (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'pending',
+            ?
+        )
+        """,
+        (
+            user["id"],
+            user.get(
+                "username",
+                ""
+            ),
+            claimed_amount,
+            DEPOSIT_METHOD,
+            txn_id,
+            None,
+            datetime.utcnow().isoformat()
+        )
+    )
+
+    conn.commit()
+
+    dep_id = cur.lastrowid
+
+    conn.close()
 
     caption = (
-        f"⚠️ Deposit #{dep_id}\n\n"
-        f"Auto verification unavailable: "
-        f"{result['reason']}\n\n"
+        f"⚠️ Deposit #{dep_id} "
+        f"(auto-verify unavailable: "
+        f"{result['reason']})\n\n"
         f"Player: @{user.get('username') or user['id']} "
         f"(ID: {user['id']})\n"
         f"Claimed Amount: {claimed_amount} ETB\n"
@@ -2182,20 +1768,18 @@ def api_deposit_submit():
         f"Status: pending"
     )
 
-
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(
-                "✅ ቀበል",
-                callback_data=f"dep_ok_{dep_id}"
-            ),
-            InlineKeyboardButton(
-                "✕ ውድቅ",
-                callback_data=f"dep_no_{dep_id}"
-            ),
-        ]]
-    )
-
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ ቀበል",
+            callback_data=
+                f"dep_ok_{dep_id}"
+        ),
+        InlineKeyboardButton(
+            "✕ ውድቅ",
+            callback_data=
+                f"dep_no_{dep_id}"
+        ),
+    ]])
 
     try:
 
@@ -2203,7 +1787,6 @@ def api_deposit_submit():
             caption,
             kb
         )
-
 
         conn = db()
 
@@ -2218,15 +1801,13 @@ def api_deposit_submit():
             (
                 msg.chat_id,
                 msg.message_id,
-                dep_id,
+                dep_id
             )
         )
-
 
         conn.commit()
 
         conn.close()
-
 
     except Exception as e:
 
@@ -2236,18 +1817,15 @@ def api_deposit_submit():
             e
         )
 
-
-    return jsonify(
-        {
-            "ok": True,
-            "status": "pending",
-            "deposit_id": dep_id,
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "status": "pending",
+        "deposit_id": dep_id
+    })
 
 
 # ============================================================
-# WITHDRAW API
+# Withdrawal API
 # ============================================================
 
 @app.route(
@@ -2267,7 +1845,6 @@ def api_withdraw_submit():
     if err:
         return err
 
-
     try:
 
         amount = int(
@@ -2277,25 +1854,22 @@ def api_withdraw_submit():
             )
         )
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError
+    ):
 
-        return jsonify(
-            {
-                "error":
+        return jsonify({
+            "error":
                 "invalid_amount"
-            }
-        ), 400
-
+        }), 400
 
     if amount <= 0:
 
-        return jsonify(
-            {
-                "error":
+        return jsonify({
+            "error":
                 "invalid_amount"
-            }
-        ), 400
-
+        }), 400
 
     account = str(
         payload.get(
@@ -2304,89 +1878,67 @@ def api_withdraw_submit():
         )
     ).strip()
 
-
     if not account:
 
-        return jsonify(
-            {
-                "error":
+        return jsonify({
+            "error":
                 "missing_account"
-            }
-        ), 400
+        }), 400
 
+    current_balance = get_balance(
+        user["id"]
+    )
 
-    with _db_lock:
+    if amount > current_balance:
 
-        conn = db()
+        return jsonify({
+            "error":
+                "insufficient_balance",
+            "balance":
+                current_balance
+        }), 400
 
+    conn = db()
 
-        balance_row = conn.execute(
-            """
-            SELECT balance
-            FROM users
-            WHERE user_id=?
-            """,
-            (user["id"],)
-        ).fetchone()
-
-
-        current_balance = (
-            balance_row["balance"]
-            if balance_row
-            else 0
+    cur = conn.execute(
+        """
+        INSERT INTO withdrawals(
+            user_id,
+            username,
+            amount,
+            method,
+            account,
+            status,
+            created_at
         )
-
-
-        if amount > current_balance:
-
-            conn.close()
-
-            return jsonify(
-                {
-                    "error":
-                    "insufficient_balance",
-                    "balance":
-                    current_balance,
-                }
-            ), 400
-
-
-        cur = conn.execute(
-            """
-            INSERT INTO withdrawals(
-                user_id,
-                username,
-                amount,
-                method,
-                account,
-                status,
-                created_at
-            )
-            VALUES (
-                ?, ?, ?, ?, ?, 'pending', ?
-            )
-            """,
-            (
-                user["id"],
-                user.get(
-                    "username",
-                    ""
-                ),
-                amount,
-                DEPOSIT_METHOD,
-                account,
-                datetime.utcnow().isoformat(),
-            )
+        VALUES (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'pending',
+            ?
         )
+        """,
+        (
+            user["id"],
+            user.get(
+                "username",
+                ""
+            ),
+            amount,
+            DEPOSIT_METHOD,
+            account,
+            datetime.utcnow().isoformat()
+        )
+    )
 
+    conn.commit()
 
-        wd_id = cur.lastrowid
+    wd_id = cur.lastrowid
 
-
-        conn.commit()
-
-        conn.close()
-
+    conn.close()
 
     text = (
         f"💸 Withdrawal #{wd_id}\n\n"
@@ -2395,24 +1947,23 @@ def api_withdraw_submit():
         f"Amount: {amount} ETB\n"
         f"Method: {DEPOSIT_METHOD}\n"
         f"Account: {account}\n"
-        f"Current Balance: {current_balance} ETB\n\n"
+        f"Current Balance: "
+        f"{current_balance} ETB\n\n"
         f"Status: pending"
     )
 
-
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(
-                "✅ ተከፍሏል",
-                callback_data=f"wd_ok_{wd_id}"
-            ),
-            InlineKeyboardButton(
-                "✕ ውድቅ",
-                callback_data=f"wd_no_{wd_id}"
-            ),
-        ]]
-    )
-
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ ተከፍሏል",
+            callback_data=
+                f"wd_ok_{wd_id}"
+        ),
+        InlineKeyboardButton(
+            "✕ ውድቅ",
+            callback_data=
+                f"wd_no_{wd_id}"
+        ),
+    ]])
 
     try:
 
@@ -2420,7 +1971,6 @@ def api_withdraw_submit():
             text,
             kb
         )
-
 
         conn = db()
 
@@ -2435,15 +1985,13 @@ def api_withdraw_submit():
             (
                 msg.chat_id,
                 msg.message_id,
-                wd_id,
+                wd_id
             )
         )
-
 
         conn.commit()
 
         conn.close()
-
 
     except Exception as e:
 
@@ -2453,17 +2001,15 @@ def api_withdraw_submit():
             e
         )
 
-
-    return jsonify(
-        {
-            "ok": True,
-            "withdrawal_id": wd_id,
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "withdrawal_id":
+            wd_id
+    })
 
 
 # ============================================================
-# TELEGRAM BOT
+# Telegram Bot
 # ============================================================
 
 BTN_PLAY = "🎰 ጨዋታ ጀምር"
@@ -2496,9 +2042,9 @@ def main_menu():
             [
                 BTN_BALANCE,
                 BTN_SUPPORT
-            ],
+            ]
         ],
-        resize_keyboard=True,
+        resize_keyboard=True
     )
 
 
@@ -2510,13 +2056,13 @@ def cancel_kb():
     )
 
 
-def is_admin(uid: int):
+def is_admin(uid: int) -> bool:
 
     return uid in ADMIN_IDS
 
 
 # ============================================================
-# START
+# Start
 # ============================================================
 
 async def start(
@@ -2526,12 +2072,10 @@ async def start(
 
     user = update.effective_user
 
-
     get_or_create_user(
         user.id,
         user.username
     )
-
 
     await update.message.reply_text(
         "👑 ወደ ROYAL BINGO እንኳን በደህና መጡ!\n\n"
@@ -2541,7 +2085,7 @@ async def start(
 
 
 # ============================================================
-# BALANCE
+# Balance
 # ============================================================
 
 async def show_balance(
@@ -2553,7 +2097,6 @@ async def show_balance(
         update.effective_user.id
     )
 
-
     await update.message.reply_text(
         f"💳 ቀሪ ሂሳብዎ፦ {bal} ETB",
         reply_markup=main_menu()
@@ -2561,7 +2104,7 @@ async def show_balance(
 
 
 # ============================================================
-# SUPPORT
+# Support
 # ============================================================
 
 async def show_support(
@@ -2570,14 +2113,15 @@ async def show_support(
 ):
 
     await update.message.reply_text(
-        f"🆘 ለማንኛውም ጥያቄ እባክዎ ያግኙን፦ "
+        f"🆘 ለማንኛውም ጥያቄ "
+        f"እባክዎ ያግኙን፦ "
         f"{SUPPORT_CONTACT}",
         reply_markup=main_menu()
     )
 
 
 # ============================================================
-# DEPOSIT START
+# Deposit
 # ============================================================
 
 async def deposit_start(
@@ -2586,29 +2130,20 @@ async def deposit_start(
 ):
 
     await update.message.reply_text(
-
-        "ገንዘብ ለማስገባት ወደ ሚከተለው "
-        "አካውንት ይላኩ፦\n\n"
-
+        "ገንዘብ ለማስገባት "
+        "ወደ ሚከተለው አካውንት ይላኩ፦\n\n"
         f"💳 ዘዴ፦ {DEPOSIT_METHOD}\n"
         f"👤 ስም፦ {DEPOSIT_ACCOUNT_NAME}\n"
         f"📱 ቁጥር፦ {DEPOSIT_ACCOUNT_NUMBER}\n\n"
-
-        "ከላኩ በኋላ የላኩትን "
-        "መጠን (በ ETB) ያስገቡ፦\n\n"
-
+        "ከላኩ በኋላ "
+        "የላኩትን መጠን "
+        "(በ ETB) ያስገቡ፦\n\n"
         "(ለመሰረዝ /cancel ይጫኑ)",
-
         reply_markup=cancel_kb()
     )
 
-
     return DEP_AMOUNT
 
-
-# ============================================================
-# DEPOSIT AMOUNT
-# ============================================================
 
 async def deposit_amount(
     update: Update,
@@ -2617,37 +2152,30 @@ async def deposit_amount(
 
     text = update.message.text.strip()
 
-
     if (
         not text.isdigit()
         or int(text) <= 0
     ):
 
         await update.message.reply_text(
-            "እባክዎ ትክክለኛ ቁጥር "
-            "ያስገቡ (ምሳሌ፦ 100)፦"
+            "እባክዎ ትክክለኛ "
+            "ቁጥር ያስገቡ "
+            "(ምሳሌ፦ 100)፦"
         )
 
         return DEP_AMOUNT
 
-
     context.user_data[
         "dep_amount"
     ] = int(text)
-
 
     await update.message.reply_text(
         "እባክዎ የግብይት ቁጥር "
         "(Transaction ID) ያስገቡ፦"
     )
 
-
     return DEP_TXNID
 
-
-# ============================================================
-# DEPOSIT TXN ID
-# ============================================================
 
 async def deposit_txnid(
     update: Update,
@@ -2663,23 +2191,15 @@ async def deposit_txnid(
         0
     )
 
-
     await update.message.reply_text(
         "⏳ በመጣራት ላይ... "
         "ትንሽ ይጠብቁ።"
     )
 
-
-    # لا نجمد Telegram event loop
     result = await asyncio.to_thread(
         verify_telebirr_payment,
         txn_id
     )
-
-
-    # ========================================================
-    # VERIFIED
-    # ========================================================
 
     if result["ok"]:
 
@@ -2687,217 +2207,7 @@ async def deposit_txnid(
             result["amount"]
         )
 
-
-        with _db_lock:
-
-            conn = db()
-
-
-            existing = conn.execute(
-                """
-                SELECT id
-                FROM deposits
-                WHERE txn_id=?
-                LIMIT 1
-                """,
-                (txn_id,)
-            ).fetchone()
-
-
-            if existing:
-
-                conn.close()
-
-                await update.message.reply_text(
-                    "❌ ይህ የግብይት ቁጥር "
-                    "ቀድሞ ጥቅም ላይ ውሏል።",
-                    reply_markup=main_menu()
-                )
-
-                context.user_data.clear()
-
-                return ConversationHandler.END
-
-
-            cur = conn.execute(
-                """
-                INSERT INTO deposits(
-                    user_id,
-                    username,
-                    amount,
-                    method,
-                    txn_id,
-                    photo_file_id,
-                    status,
-                    created_at
-                )
-                VALUES (
-                    ?, ?, ?, ?, ?, ?, 'completed', ?
-                )
-                """,
-                (
-                    user.id,
-                    user.username or "",
-                    verified_amount,
-                    DEPOSIT_METHOD,
-                    txn_id,
-                    None,
-                    datetime.utcnow().isoformat(),
-                )
-            )
-
-
-            dep_id = cur.lastrowid
-
-
-            conn.execute(
-                """
-                UPDATE users
-                SET balance =
-                    balance + ?
-                WHERE user_id=?
-                """,
-                (
-                    verified_amount,
-                    user.id,
-                )
-            )
-
-
-            balance_row = conn.execute(
-                """
-                SELECT balance
-                FROM users
-                WHERE user_id=?
-                """,
-                (user.id,)
-            ).fetchone()
-
-
-            new_balance = (
-                balance_row["balance"]
-                if balance_row
-                else 0
-            )
-
-
-            conn.commit()
-
-            conn.close()
-
-
-        await update.message.reply_text(
-            f"🎉 ተረጋግጧል! "
-            f"{verified_amount} ETB "
-            f"ወደ ሂሳብዎ ገብቷል።\n"
-            f"ቀሪ ሂሳብ፦ "
-            f"{new_balance} ETB",
-            reply_markup=main_menu()
-        )
-
-
-        try:
-
-            await context.bot.send_message(
-                ADMIN_CHAT_ID,
-                f"✅ Auto-Verified Deposit #{dep_id}\n"
-                f"Player: @{user.username or user.id} "
-                f"(ID: {user.id})\n"
-                f"Amount: {verified_amount} ETB\n"
-                f"Sender: {result.get('sender_name', '?')}\n"
-                f"Txn: {txn_id}\n"
-                f"Balance: {new_balance} ETB"
-            )
-
-        except Exception as e:
-
-            log.warning(
-                "notify admin failed: %s",
-                e
-            )
-
-
-        context.user_data.clear()
-
-        return ConversationHandler.END
-
-
-    # ========================================================
-    # HARD REJECT
-    # ========================================================
-
-    if not result.get(
-        "fallback_to_manual"
-    ):
-
-        reason_text = {
-
-            "not_verified":
-                "ይህ የግብይት ቁጥር "
-                "ትክክል አይደለም።",
-
-            "duplicate_transaction":
-                "ይህ ግብይት ቀደም ብሎ "
-                "ጥቅም ላይ ውሏል።",
-
-            "wrong_recipient":
-                "ይህ ክፍያ ወደ እኛ "
-                "አካውንት አልደረሰም۔",
-
-        }.get(
-            result["reason"],
-            "ማረጋገጫው አልተሳካም።"
-        )
-
-
-        await update.message.reply_text(
-            f"❌ {reason_text}\n"
-            f"እባክዎ ትክክለኛ መረጃ "
-            f"በድጋሚ ያስገቡ ወይም "
-            f"{SUPPORT_CONTACT} ያግኙ።",
-            reply_markup=main_menu()
-        )
-
-
-        context.user_data.clear()
-
-        return ConversationHandler.END
-
-
-    # ========================================================
-    # MANUAL FALLBACK
-    # ========================================================
-
-    with _db_lock:
-
         conn = db()
-
-
-        existing = conn.execute(
-            """
-            SELECT id
-            FROM deposits
-            WHERE txn_id=?
-            LIMIT 1
-            """,
-            (txn_id,)
-        ).fetchone()
-
-
-        if existing:
-
-            conn.close()
-
-            await update.message.reply_text(
-                "❌ ይህ የግብይት ቁጥር "
-                "ቀድሞ ቀርቧል።",
-                reply_markup=main_menu()
-            )
-
-            context.user_data.clear()
-
-            return ConversationHandler.END
-
 
         cur = conn.execute(
             """
@@ -2912,62 +2222,200 @@ async def deposit_txnid(
                 created_at
             )
             VALUES (
-                ?, ?, ?, ?, ?, ?, 'pending', ?
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                ?,
+                'completed',
+                ?
             )
             """,
             (
                 user.id,
                 user.username or "",
-                claimed_amount,
+                verified_amount,
                 DEPOSIT_METHOD,
                 txn_id,
                 None,
-                datetime.utcnow().isoformat(),
+                datetime.utcnow().isoformat()
             )
         )
 
-
         dep_id = cur.lastrowid
 
+        conn.execute(
+            """
+            UPDATE users
+            SET balance =
+                balance + ?
+            WHERE user_id=?
+            """,
+            (
+                verified_amount,
+                user.id
+            )
+        )
 
         conn.commit()
 
+        new_balance = get_balance(
+            user.id
+        )
+
         conn.close()
 
+        await update.message.reply_text(
+            f"🎉 ተረጋግጧል! "
+            f"{verified_amount} ETB "
+            f"ወደ ሂሳብዎ ገብቷል።\n"
+            f"ቀሪ ሂሳብ፦ "
+            f"{new_balance} ETB",
+            reply_markup=main_menu()
+        )
+
+        try:
+
+            await context.bot.send_message(
+                ADMIN_CHAT_ID,
+                f"✅ Auto-Verified Deposit #{dep_id}\n"
+                f"Player: "
+                f"@{user.username or user.id} "
+                f"(ID: {user.id})\n"
+                f"Amount: "
+                f"{verified_amount} ETB\n"
+                f"Sender: "
+                f"{result.get('sender_name','?')}\n"
+                f"Txn: {txn_id}\n"
+                f"Balance: "
+                f"{new_balance} ETB"
+            )
+
+        except Exception as e:
+
+            log.warning(
+                "notify admin failed: %s",
+                e
+            )
+
+        context.user_data.clear()
+
+        return ConversationHandler.END
+
+    if not result.get(
+        "fallback_to_manual"
+    ):
+
+        reason_text = {
+            "not_verified":
+                "ይህ የግብይት ቁጥር "
+                "ትክክል አይደለም "
+                "ወይም አልተገኘም።",
+
+            "duplicate_transaction":
+                "ይህ ግብይት "
+                "ቀደም ብሎ ጥቅም "
+                "ላይ ውሏል።",
+
+            "wrong_recipient":
+                "ይህ ክፍያ "
+                "ወደ እኛ አካውንት "
+                "አልደረሰም።",
+        }.get(
+            result["reason"],
+            "ማረጋገጫው "
+            "አልተሳካም።"
+        )
+
+        await update.message.reply_text(
+            f"❌ {reason_text}\n"
+            f"እባክዎ ትክክለኛ መረጃ "
+            f"በድጋሚ ያስገቡ "
+            f"ወይም "
+            f"{SUPPORT_CONTACT} ያግኙ።",
+            reply_markup=main_menu()
+        )
+
+        context.user_data.clear()
+
+        return ConversationHandler.END
+
+    # ========================================================
+    # Manual fallback
+    # ========================================================
+
+    conn = db()
+
+    cur = conn.execute(
+        """
+        INSERT INTO deposits(
+            user_id,
+            username,
+            amount,
+            method,
+            txn_id,
+            photo_file_id,
+            status,
+            created_at
+        )
+        VALUES (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'pending',
+            ?
+        )
+        """,
+        (
+            user.id,
+            user.username or "",
+            claimed_amount,
+            DEPOSIT_METHOD,
+            txn_id,
+            None,
+            datetime.utcnow().isoformat()
+        )
+    )
+
+    conn.commit()
+
+    dep_id = cur.lastrowid
+
+    conn.close()
 
     caption = (
         f"⚠️ Deposit #{dep_id}\n\n"
-        f"Auto verification unavailable: "
-        f"{result['reason']}\n\n"
         f"Player: @{user.username or user.id} "
         f"(ID: {user.id})\n"
-        f"Claimed Amount: {claimed_amount} ETB\n"
+        f"Claimed Amount: "
+        f"{claimed_amount} ETB\n"
         f"Method: {DEPOSIT_METHOD}\n"
         f"Transaction ID: {txn_id}\n\n"
         f"Status: pending"
     )
 
-
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(
-                "✅ ቀበል",
-                callback_data=f"dep_ok_{dep_id}"
-            ),
-            InlineKeyboardButton(
-                "✕ ውድቅ",
-                callback_data=f"dep_no_{dep_id}"
-            ),
-        ]]
-    )
-
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ ቀበል",
+            callback_data=
+                f"dep_ok_{dep_id}"
+        ),
+        InlineKeyboardButton(
+            "✕ ውድቅ",
+            callback_data=
+                f"dep_no_{dep_id}"
+        ),
+    ]])
 
     msg = await context.bot.send_message(
         ADMIN_CHAT_ID,
         caption,
         reply_markup=kb
     )
-
 
     conn = db()
 
@@ -2982,15 +2430,13 @@ async def deposit_txnid(
         (
             msg.chat_id,
             msg.message_id,
-            dep_id,
+            dep_id
         )
     )
-
 
     conn.commit()
 
     conn.close()
-
 
     await update.message.reply_text(
         f"✅ ጥያቄዎ (#{dep_id}) ደርሷል፣ "
@@ -2998,6 +2444,124 @@ async def deposit_txnid(
         reply_markup=main_menu()
     )
 
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# Deposit screenshot
+# ============================================================
+
+async def deposit_screenshot(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    photo = update.message.photo[-1]
+
+    claimed_amount = context.user_data.get(
+        "dep_amount",
+        0
+    )
+
+    txn_id = context.user_data.get(
+        "dep_txnid",
+        ""
+    )
+
+    file_id = photo.file_id
+
+    conn = db()
+
+    cur = conn.execute(
+        """
+        INSERT INTO deposits(
+            user_id,
+            username,
+            amount,
+            method,
+            txn_id,
+            photo_file_id,
+            status,
+            created_at
+        )
+        VALUES (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'pending',
+            ?
+        )
+        """,
+        (
+            user.id,
+            user.username or "",
+            claimed_amount,
+            DEPOSIT_METHOD,
+            txn_id,
+            file_id,
+            datetime.utcnow().isoformat()
+        )
+    )
+
+    conn.commit()
+
+    dep_id = cur.lastrowid
+
+    conn.close()
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ ቀበል",
+            callback_data=
+                f"dep_ok_{dep_id}"
+        ),
+        InlineKeyboardButton(
+            "✕ ውድቅ",
+            callback_data=
+                f"dep_no_{dep_id}"
+        ),
+    ]])
+
+    try:
+
+        await context.bot.send_photo(
+            chat_id=ADMIN_CHAT_ID,
+            photo=file_id,
+            caption=(
+                f"⚠️ Deposit #{dep_id}\n\n"
+                f"Player: "
+                f"@{user.username or user.id} "
+                f"(ID: {user.id})\n"
+                f"Amount: "
+                f"{claimed_amount} ETB\n"
+                f"Transaction ID: "
+                f"{txn_id or 'N/A'}\n\n"
+                f"Status: pending"
+            ),
+            reply_markup=kb
+        )
+
+    except Exception as e:
+
+        log.exception(
+            "Failed to send deposit screenshot: %s",
+            e
+        )
+
+    await update.message.reply_text(
+        f"✅ የክፍያ ማረጋገጫ "
+        f"(#{dep_id}) ደርሷል።\n"
+        f"አድሚን እስኪያረጋግጥ "
+        f"ይጠብቁ።",
+        reply_markup=main_menu()
+    )
 
     context.user_data.clear()
 
@@ -3005,7 +2569,7 @@ async def deposit_txnid(
 
 
 # ============================================================
-# WITHDRAW START
+# Withdrawal
 # ============================================================
 
 async def withdraw_start(
@@ -3017,7 +2581,6 @@ async def withdraw_start(
         update.effective_user.id
     )
 
-
     if bal <= 0:
 
         await update.message.reply_text(
@@ -3027,22 +2590,17 @@ async def withdraw_start(
 
         return ConversationHandler.END
 
-
     await update.message.reply_text(
-        f"ቀሪ ሂሳብዎ፦ {bal} ETB\n\n"
-        "ምን ያህል ማውጣት ይፈልጋሉ? "
-        "(በ ETB)፦\n\n"
-        "(ለመሰረዝ /cancel ይጫኑ)",
+        f"ቀሪ ሂሳብዎ፦ "
+        f"{bal} ETB\n\n"
+        f"ምን ያህል ማውጣት "
+        f"ይፈልጋሉ? (በ ETB)፦\n\n"
+        f"(ለመሰረዝ /cancel ይጫኑ)",
         reply_markup=cancel_kb()
     )
 
-
     return WD_AMOUNT
 
-
-# ============================================================
-# WITHDRAW AMOUNT
-# ============================================================
 
 async def withdraw_amount(
     update: Update,
@@ -3051,57 +2609,47 @@ async def withdraw_amount(
 
     text = update.message.text.strip()
 
-
     if (
         not text.isdigit()
         or int(text) <= 0
     ):
 
         await update.message.reply_text(
-            "እባክዎ ትክክለኛ ቁጥር "
-            "ያስገቡ፦"
+            "እባክዎ ትክክለኛ "
+            "ቁጥር ያስገቡ፦"
         )
 
         return WD_AMOUNT
 
-
     amount = int(text)
-
 
     bal = get_balance(
         update.effective_user.id
     )
 
-
     if amount > bal:
 
         await update.message.reply_text(
             f"በቂ ቀሪ ሂሳብ የለዎትም። "
-            f"ቀሪ ሂሳብዎ፦ {bal} ETB\n\n"
-            "ሌላ መጠን ያስገቡ፦"
+            f"ቀሪ ሂሳብዎ፦ "
+            f"{bal} ETB\n\n"
+            f"ሌላ መጠን ያስገቡ፦"
         )
 
         return WD_AMOUNT
-
 
     context.user_data[
         "wd_amount"
     ] = amount
 
-
     await update.message.reply_text(
         f"ገንዘቡ የሚላክበትን "
-        f"የ{DEPOSIT_METHOD} ስልክ ቁጥር "
-        f"ያስገቡ፦"
+        f"የ{DEPOSIT_METHOD} "
+        f"ስልክ ቁጥር ያስገቡ፦"
     )
-
 
     return WD_PHONE
 
-
-# ============================================================
-# WITHDRAW PHONE
-# ============================================================
 
 async def withdraw_phone(
     update: Update,
@@ -3116,76 +2664,48 @@ async def withdraw_phone(
         "wd_amount"
     ]
 
+    current_balance = get_balance(
+        user.id
+    )
 
-    with _db_lock:
+    conn = db()
 
-        conn = db()
-
-
-        balance_row = conn.execute(
-            """
-            SELECT balance
-            FROM users
-            WHERE user_id=?
-            """,
-            (user.id,)
-        ).fetchone()
-
-
-        current_balance = (
-            balance_row["balance"]
-            if balance_row
-            else 0
+    cur = conn.execute(
+        """
+        INSERT INTO withdrawals(
+            user_id,
+            username,
+            amount,
+            method,
+            account,
+            status,
+            created_at
         )
-
-
-        if amount > current_balance:
-
-            conn.close()
-
-            await update.message.reply_text(
-                "❌ በቂ ቀሪ ሂሳብ የለዎትም።",
-                reply_markup=main_menu()
-            )
-
-            context.user_data.clear()
-
-            return ConversationHandler.END
-
-
-        cur = conn.execute(
-            """
-            INSERT INTO withdrawals(
-                user_id,
-                username,
-                amount,
-                method,
-                account,
-                status,
-                created_at
-            )
-            VALUES (
-                ?, ?, ?, ?, ?, 'pending', ?
-            )
-            """,
-            (
-                user.id,
-                user.username or "",
-                amount,
-                DEPOSIT_METHOD,
-                account,
-                datetime.utcnow().isoformat(),
-            )
+        VALUES (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'pending',
+            ?
         )
+        """,
+        (
+            user.id,
+            user.username or "",
+            amount,
+            DEPOSIT_METHOD,
+            account,
+            datetime.utcnow().isoformat()
+        )
+    )
 
+    conn.commit()
 
-        wd_id = cur.lastrowid
+    wd_id = cur.lastrowid
 
-
-        conn.commit()
-
-        conn.close()
-
+    conn.close()
 
     text = (
         f"💸 Withdrawal #{wd_id}\n\n"
@@ -3194,31 +2714,29 @@ async def withdraw_phone(
         f"Amount: {amount} ETB\n"
         f"Method: {DEPOSIT_METHOD}\n"
         f"Account: {account}\n"
-        f"Current Balance: {current_balance} ETB\n\n"
+        f"Current Balance: "
+        f"{current_balance} ETB\n\n"
         f"Status: pending"
     )
 
-
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(
-                "✅ ተከፍሏል",
-                callback_data=f"wd_ok_{wd_id}"
-            ),
-            InlineKeyboardButton(
-                "✕ ውድቅ",
-                callback_data=f"wd_no_{wd_id}"
-            ),
-        ]]
-    )
-
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ ተከፍሏል",
+            callback_data=
+                f"wd_ok_{wd_id}"
+        ),
+        InlineKeyboardButton(
+            "✕ ውድቅ",
+            callback_data=
+                f"wd_no_{wd_id}"
+        ),
+    ]])
 
     msg = await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=text,
         reply_markup=kb
     )
-
 
     conn = db()
 
@@ -3233,25 +2751,23 @@ async def withdraw_phone(
         (
             msg.chat_id,
             msg.message_id,
-            wd_id,
+            wd_id
         )
     )
-
 
     conn.commit()
 
     conn.close()
 
-
     await update.message.reply_text(
-        f"✅ የማውጣት ጥያቄዎ (#{wd_id}) ደርሷል።\n"
-        "አድሚን እስኪያረጋግጥ "
-        "በመጠባበቅ ላይ ነው። "
-        "ቀሪ ሂሳብዎ እስከዚያ ድረስ "
-        "አይቀየርም።",
+        f"✅ የማውጣት ጥያቄዎ "
+        f"(#{wd_id}) ደርሷል።\n"
+        f"አድሚን እስኪያረጋግጥ "
+        f"በመጠባበቅ ላይ ነው። "
+        f"ቀሪ ሂሳብዎ እስከዚያ "
+        f"ድረስ አይቀየርም።",
         reply_markup=main_menu()
     )
-
 
     context.user_data.clear()
 
@@ -3259,7 +2775,7 @@ async def withdraw_phone(
 
 
 # ============================================================
-# CANCEL
+# Cancel
 # ============================================================
 
 async def cancel_conv(
@@ -3269,18 +2785,16 @@ async def cancel_conv(
 
     context.user_data.clear()
 
-
     await update.message.reply_text(
         "ተሰርዟል።",
         reply_markup=main_menu()
     )
 
-
     return ConversationHandler.END
 
 
 # ============================================================
-# DEPOSIT ADMIN CALLBACK
+# Deposit callback
 # ============================================================
 
 async def handle_deposit_callback(
@@ -3289,7 +2803,6 @@ async def handle_deposit_callback(
 ):
 
     query = update.callback_query
-
 
     if not is_admin(
         query.from_user.id
@@ -3302,33 +2815,31 @@ async def handle_deposit_callback(
 
         return
 
+    action, dep_id_str = (
+        query.data.split("_")[1:3]
+    )
 
-    parts = query.data.split("_")
-
-    action = parts[1]
-
-    dep_id = int(parts[2])
+    dep_id = int(
+        dep_id_str
+    )
 
     approve = (
         action == "ok"
     )
 
-
     with _db_lock:
 
         conn = db()
-
 
         dep = conn.execute(
             """
             SELECT *
             FROM deposits
             WHERE id=?
-              AND status='pending'
+            AND status='pending'
             """,
             (dep_id,)
         ).fetchone()
-
 
         if dep is None:
 
@@ -3341,13 +2852,11 @@ async def handle_deposit_callback(
 
             return
 
-
         new_status = (
             "completed"
             if approve
             else "rejected"
         )
-
 
         conn.execute(
             """
@@ -3357,15 +2866,13 @@ async def handle_deposit_callback(
             """,
             (
                 new_status,
-                dep_id,
+                dep_id
             )
         )
-
 
         old_balance = get_balance(
             dep["user_id"]
         )
-
 
         if approve:
 
@@ -3378,21 +2885,17 @@ async def handle_deposit_callback(
                 """,
                 (
                     dep["amount"],
-                    dep["user_id"],
+                    dep["user_id"]
                 )
             )
 
-
         conn.commit()
-
 
         new_balance = get_balance(
             dep["user_id"]
         )
 
-
         conn.close()
-
 
     status_line = (
         "✅ ACCEPTED"
@@ -3401,36 +2904,47 @@ async def handle_deposit_callback(
         "❌ REJECTED"
     )
 
-
     new_caption = (
         f"💰 Deposit #{dep_id}\n\n"
-        f"Player: @{dep['username'] or dep['user_id']} "
+        f"Player: "
+        f"@{dep['username'] or dep['user_id']} "
         f"(ID: {dep['user_id']})\n"
         f"Amount: {dep['amount']} ETB\n"
         f"Method: {dep['method']}\n"
-        f"Transaction ID: {dep['txn_id']}\n\n"
+        f"Transaction ID: "
+        f"{dep['txn_id']}\n\n"
         f"Status: {status_line}"
-    )
-
-
-    if approve:
-
-        new_caption += (
+        +
+        (
             f"\nBalance: "
             f"{old_balance} → "
             f"{new_balance} ETB"
+            if approve
+            else ""
         )
-
-
-    await query.edit_message_text(
-        text=new_caption
     )
 
+    try:
+
+        await query.edit_message_caption(
+            caption=new_caption
+        )
+
+    except Exception:
+
+        try:
+
+            await query.edit_message_text(
+                text=new_caption
+            )
+
+        except Exception:
+
+            pass
 
     await query.answer(
         "Done ✅"
     )
-
 
     try:
 
@@ -3439,7 +2953,8 @@ async def handle_deposit_callback(
             await context.bot.send_message(
                 dep["user_id"],
                 f"🎉 የክፍያ ጥያቄዎ "
-                f"(#{dep_id}) ተቀባይነት አግኝቷል!\n"
+                f"(#{dep_id}) "
+                f"ተቀባይነት አግኝቷል!\n"
                 f"ቀሪ ሂሳብዎ፦ "
                 f"{old_balance} → "
                 f"{new_balance} ETB"
@@ -3450,11 +2965,11 @@ async def handle_deposit_callback(
             await context.bot.send_message(
                 dep["user_id"],
                 f"❌ የክፍያ ጥያቄዎ "
-                f"(#{dep_id}) ውድቅ ተደርጓል።\n"
+                f"(#{dep_id}) "
+                f"ውድቅ ተደርጓል። "
                 f"ለበለጠ መረጃ "
                 f"{SUPPORT_CONTACT} ያግኙ።"
             )
-
 
     except Exception as e:
 
@@ -3465,7 +2980,7 @@ async def handle_deposit_callback(
 
 
 # ============================================================
-# WITHDRAW ADMIN CALLBACK
+# Withdrawal callback
 # ============================================================
 
 async def handle_withdrawal_callback(
@@ -3474,7 +2989,6 @@ async def handle_withdrawal_callback(
 ):
 
     query = update.callback_query
-
 
     if not is_admin(
         query.from_user.id
@@ -3487,33 +3001,31 @@ async def handle_withdrawal_callback(
 
         return
 
+    action, wd_id_str = (
+        query.data.split("_")[1:3]
+    )
 
-    parts = query.data.split("_")
-
-    action = parts[1]
-
-    wd_id = int(parts[2])
+    wd_id = int(
+        wd_id_str
+    )
 
     approve = (
         action == "ok"
     )
 
-
     with _db_lock:
 
         conn = db()
-
 
         wd = conn.execute(
             """
             SELECT *
             FROM withdrawals
             WHERE id=?
-              AND status='pending'
+            AND status='pending'
             """,
             (wd_id,)
         ).fetchone()
-
 
         if wd is None:
 
@@ -3526,25 +3038,11 @@ async def handle_withdrawal_callback(
 
             return
 
-
         if approve:
 
-            bal_row = conn.execute(
-                """
-                SELECT balance
-                FROM users
-                WHERE user_id=?
-                """,
-                (wd["user_id"],)
-            ).fetchone()
-
-
-            bal = (
-                bal_row["balance"]
-                if bal_row
-                else 0
+            bal = get_balance(
+                wd["user_id"]
             )
-
 
             if bal < wd["amount"]:
 
@@ -3558,7 +3056,6 @@ async def handle_withdrawal_callback(
 
                 return
 
-
             conn.execute(
                 """
                 UPDATE users
@@ -3568,10 +3065,9 @@ async def handle_withdrawal_callback(
                 """,
                 (
                     wd["amount"],
-                    wd["user_id"],
+                    wd["user_id"]
                 )
             )
-
 
             conn.execute(
                 """
@@ -3582,14 +3078,11 @@ async def handle_withdrawal_callback(
                 (wd_id,)
             )
 
-
             conn.commit()
-
 
             new_balance = get_balance(
                 wd["user_id"]
             )
-
 
         else:
 
@@ -3602,14 +3095,11 @@ async def handle_withdrawal_callback(
                 (wd_id,)
             )
 
-
             conn.commit()
 
             new_balance = None
 
-
         conn.close()
-
 
     status_line = (
         "✅ PAID"
@@ -3618,41 +3108,32 @@ async def handle_withdrawal_callback(
         "❌ REJECTED"
     )
 
-
     new_text = (
         f"💸 Withdrawal #{wd_id}\n\n"
-        f"Player: @{wd['username'] or wd['user_id']} "
+        f"Player: "
+        f"@{wd['username'] or wd['user_id']} "
         f"(ID: {wd['user_id']})\n"
         f"Amount: {wd['amount']} ETB\n"
         f"Method: {wd['method']}\n"
         f"Account: {wd['account']}\n\n"
         f"Status: {status_line}"
-    )
-
-
-    if approve:
-
-        new_text += (
+        +
+        (
             f"\nRemaining Balance: "
             f"{new_balance} ETB"
-        )
-
-    else:
-
-        new_text += (
+            if approve
+            else
             "\nBalance unchanged"
         )
-
+    )
 
     await query.edit_message_text(
         text=new_text
     )
 
-
     await query.answer(
         "Done ✅"
     )
-
 
     try:
 
@@ -3673,10 +3154,11 @@ async def handle_withdrawal_callback(
             await context.bot.send_message(
                 wd["user_id"],
                 f"❌ የማውጣት ጥያቄዎ "
-                f"(#{wd_id}) ውድቅ ተደርጓል።\n"
-                f"ቀሪ ሂሳብዎ አልተቀየረም።"
+                f"(#{wd_id}) "
+                f"ውድቅ ተደርጓል። "
+                f"ቀሪ ሂሳብዎ "
+                f"አልተቀየረም።"
             )
-
 
     except Exception as e:
 
@@ -3687,7 +3169,7 @@ async def handle_withdrawal_callback(
 
 
 # ============================================================
-# BUILD BOT
+# Build Telegram Application
 # ============================================================
 
 def build_bot_application():
@@ -3699,14 +3181,12 @@ def build_bot_application():
         .build()
     )
 
-
     application.add_handler(
         CommandHandler(
             "start",
             start
         )
     )
-
 
     application.add_handler(
         MessageHandler(
@@ -3717,7 +3197,6 @@ def build_bot_application():
         )
     )
 
-
     application.add_handler(
         MessageHandler(
             filters.Regex(
@@ -3727,10 +3206,9 @@ def build_bot_application():
         )
     )
 
-
-    # --------------------------------------------------------
-    # Deposit
-    # --------------------------------------------------------
+    # ========================================================
+    # Deposit conversation
+    # ========================================================
 
     deposit_conv = ConversationHandler(
 
@@ -3760,6 +3238,13 @@ def build_bot_application():
                     deposit_txnid
                 )
             ],
+
+            DEP_SCREENSHOT: [
+                MessageHandler(
+                    filters.PHOTO,
+                    deposit_screenshot
+                )
+            ],
         },
 
         fallbacks=[
@@ -3770,15 +3255,13 @@ def build_bot_application():
         ],
     )
 
-
     application.add_handler(
         deposit_conv
     )
 
-
-    # --------------------------------------------------------
-    # Withdrawal
-    # --------------------------------------------------------
+    # ========================================================
+    # Withdrawal conversation
+    # ========================================================
 
     withdraw_conv = ConversationHandler(
 
@@ -3818,11 +3301,9 @@ def build_bot_application():
         ],
     )
 
-
     application.add_handler(
         withdraw_conv
     )
-
 
     application.add_handler(
         CallbackQueryHandler(
@@ -3831,44 +3312,35 @@ def build_bot_application():
         )
     )
 
-
     application.add_handler(
         CallbackQueryHandler(
             handle_withdrawal_callback,
             pattern=r"^wd_"
         )
-
-
     )
-
 
     return application
 
 
 # ============================================================
-# BOT THREAD
+# Telegram Bot
+# ============================================================
+#
+# مهم جدًا:
+# run_polling() يجب أن يعمل في Main Thread.
+# لا نضعه داخل threading.Thread.
 # ============================================================
 
-def run_bot_in_thread():
+def run_bot():
 
-    loop = asyncio.new_event_loop()
-
-    asyncio.set_event_loop(loop)
-
-
-    application = (
-        build_bot_application()
-    )
-
+    application = build_bot_application()
 
     log.info(
         "Telegram bot polling starting..."
     )
 
-
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        close_loop=False
+        allowed_updates=Update.ALL_TYPES
     )
 
 
@@ -3878,34 +3350,54 @@ def run_bot_in_thread():
 
 if __name__ == "__main__":
 
+    # قاعدة البيانات
     init_db()
 
-
+    # إنشاء الجولة الأولى
     get_or_create_active_round()
 
-
-    threading.Thread(
-        target=run_bot_in_thread,
-        daemon=True,
-        name="telegram-bot"
-    ).start()
-
+    # ========================================================
+    # Round Engine في Thread منفصل
+    # ========================================================
 
     threading.Thread(
         target=round_engine_loop,
         daemon=True,
-        name="round-engine"
+        name="RoundEngine"
     ).start()
 
+    # ========================================================
+    # Flask في Thread منفصل
+    # ========================================================
+
+    threading.Thread(
+        target=lambda: app.run(
+            host="0.0.0.0",
+            port=PORT,
+            threaded=True
+        ),
+        daemon=True,
+        name="FlaskServer"
+    ).start()
 
     log.info(
         "Flask API starting on port %s ...",
         PORT
     )
 
+    # ========================================================
+    # Telegram Bot في Main Thread
+    # ========================================================
+    #
+    # هذا هو الإصلاح الأساسي لمشكلة:
+    #
+    # ValueError:
+    # set_wakeup_fd only works in main thread
+    #
+    # ========================================================
 
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        threaded=True
+    log.info(
+        "Starting Telegram bot in main thread..."
     )
+
+    run_bot()
