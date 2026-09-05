@@ -1,86 +1,58 @@
+"""
+ROYAL BINGO — Server (Bot + Game API)
+=====================================
+
+ملف واحد يشغّل:
+1. Telegram Bot
+2. Round Engine
+3. Flask Game API
+
+القواعد:
+- أول Bingo يوقف الجولة فورًا.
+- جميع اللاعبين في الجولة يرون نفس تسلسل الكرات.
+- Prize Pool = 80% من مجموع Entry Stake المدفوع في الجولة.
+- عند التعادل في نفس الكرة، يتم تقسيم Prize Pool بالتساوي بين
+  جميع الكرتيلات الفائزة.
+- الرصيد والنتيجة والفوز يقررها السيرفر فقط.
+"""
+
 import os
-import sqlite3
+import json
+import time
+import random
+import hmac
+import hashlib
 import logging
 import threading
+import urllib.parse
+import asyncio
 import uuid
+import requests
+import sqlite3
+
 from datetime import datetime
 
-import requests
 from flask import Flask, request, jsonify
 
 from telegram import (
     Update,
+    Bot,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    WebAppInfo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    WebAppInfo,
 )
 
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
 )
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-TOKEN = os.getenv("TOKEN")
-
-WEBAPP_URL = os.getenv(
-    "WEBAPP_URL",
-    "https://abdusiraj609-a11y.github.io/Royal-Bingo-/"
-)
-
-DEPOSIT_PHONE = os.getenv("DEPOSIT_PHONE", "")
-
-VERIFY_ET_API_KEY = os.getenv("VERIFY_ET_API_KEY", "")
-
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-
-VERIFY_ET_BASE_URL = os.getenv(
-    "VERIFY_ET_BASE_URL",
-    "https://verify.et"
-)
-
-DEPOSIT_BANK = os.getenv(
-    "DEPOSIT_BANK",
-    "telebirr"
-)
-
-PORT = int(os.getenv("PORT", "5000"))
-
-DB_PATH = os.getenv(
-    "DB_PATH",
-    "royal_bingo.db"
-)
-
-ENTRY_FEE = float(
-    os.getenv("ENTRY_FEE", "10")
-)
-
-MAX_PLAYERS = int(
-    os.getenv("MAX_PLAYERS", "500")
-)
-
-PRIZE_PERCENT = float(
-    os.getenv("PRIZE_PERCENT", "80")
-)
-
-SUPPORT_USERNAME = os.getenv(
-    "SUPPORT_USERNAME",
-    "@RoyalBingoSupport"
-)
-
-
-if not TOKEN:
-    raise RuntimeError(
-        "TOKEN environment variable is not set"
-    )
 
 
 # ============================================================
@@ -89,27 +61,86 @@ if not TOKEN:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-logger = logging.getLogger("royal-bingo")
+log = logging.getLogger("royal_bingo_server")
 
-app = Flask(__name__)
 
-CARTELA_PRICE = 10.0
-CARTELA_PRIZE_POOL = 8.0
-MIN_WITHDRAW = 50.0
+# ============================================================
+# SETTINGS
+# ============================================================
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
+
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    if x.strip()
+}
+
+WEBAPP_URL = os.environ.get(
+    "WEBAPP_URL",
+    "https://example.com"
+)
+
+SUPPORT_CONTACT = os.environ.get(
+    "SUPPORT_CONTACT",
+    "@your_support_username"
+)
+
+PORT = int(
+    os.environ.get("PORT", "5000")
+)
+
+
+# ============================================================
+# TELEBIRR / DEPOSIT SETTINGS
+# ============================================================
+
+DEPOSIT_METHOD = "Telebirr"
+
+DEPOSIT_ACCOUNT_NAME = "Abdurahman"
+
+DEPOSIT_ACCOUNT_NUMBER = "0993946560"
+
+
+# ============================================================
+# VERIFY.ET
+# ============================================================
+
+VERIFY_ET_API_KEY = os.environ.get(
+    "VERIFY_ET_API_KEY",
+    ""
+)
+
+VERIFY_ET_BASE_URL = "https://verify.et"
+
+VERIFY_ET_WAIT_MS = int(
+    os.environ.get("VERIFY_ET_WAIT_MS", "8000")
+)
+
+
 # ============================================================
 # DATABASE
 # ============================================================
 
-db_lock = threading.Lock()
+DB_PATH = os.environ.get(
+    "DB_PATH",
+    "royal_bingo.db"
+)
 
 
-def get_db():
+_db_lock = threading.Lock()
+
+
+def db():
     conn = sqlite3.connect(
         DB_PATH,
-        check_same_thread=False
+        timeout=30,
+        check_same_thread=False,
     )
 
     conn.row_factory = sqlite3.Row
@@ -117,529 +148,2371 @@ def get_db():
     return conn
 
 
+# ============================================================
+# GAME ECONOMY
+# ============================================================
+
+ENTRY_STAKE = int(
+    os.environ.get("ENTRY_STAKE", "10")
+)
+
+MAX_CARTELAS = int(
+    os.environ.get("MAX_CARTELAS", "4")
+)
+
+COLLECT_SECONDS = int(
+    os.environ.get("COLLECT_SECONDS", "45")
+)
+
+BALL_DRAW_SECONDS = float(
+    os.environ.get("BALL_DRAW_SECONDS", "2.0")
+)
+
+PAYOUT_RATIO = float(
+    os.environ.get("PAYOUT_RATIO", "0.80")
+)
+
+
+# ============================================================
+# CONVERSATION STATES
+# ============================================================
+
+DEP_AMOUNT = 1
+DEP_TXNID = 2
+
+WD_AMOUNT = 3
+WD_PHONE = 4
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
 def init_db():
 
-    with db_lock:
+    conn = db()
 
-        conn = get_db()
-        cur = conn.cursor()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        balance INTEGER NOT NULL DEFAULT 0
+    );
 
-        # ----------------------------------------------------
-        # USERS
-        # ----------------------------------------------------
+    CREATE TABLE IF NOT EXISTS deposits(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        amount INTEGER NOT NULL,
+        method TEXT NOT NULL,
+        txn_id TEXT,
+        photo_file_id TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        admin_msg_chat_id INTEGER,
+        admin_msg_id INTEGER,
+        created_at TEXT NOT NULL
+    );
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id TEXT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
+    CREATE TABLE IF NOT EXISTS withdrawals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        amount INTEGER NOT NULL,
+        method TEXT NOT NULL,
+        account TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        admin_msg_chat_id INTEGER,
+        admin_msg_id INTEGER,
+        created_at TEXT NOT NULL
+    );
 
-                balance REAL DEFAULT 0,
+    CREATE TABLE IF NOT EXISTS rounds(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL DEFAULT 'collecting',
+        close_at REAL NOT NULL,
+        ball_sequence TEXT,
+        active_started_at REAL,
+        next_ball_at REAL,
+        called_balls TEXT NOT NULL DEFAULT '[]',
+        prize_pool INTEGER NOT NULL DEFAULT 0,
+        finished_at REAL,
+        created_at TEXT NOT NULL
+    );
 
-                total_deposit REAL DEFAULT 0,
-                total_withdraw REAL DEFAULT 0,
-                total_won REAL DEFAULT 0,
+    CREATE TABLE IF NOT EXISTS round_entries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        round_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        username TEXT,
+        grid TEXT NOT NULL,
+        stake_paid INTEGER NOT NULL,
+        is_winner INTEGER NOT NULL DEFAULT 0,
+        payout INTEGER NOT NULL DEFAULT 0
+    );
+    """)
 
-                referral_code TEXT UNIQUE,
-                referred_by TEXT,
-                referral_earnings REAL DEFAULT 0,
+    conn.commit()
 
-                created_at TIMESTAMP
-                    DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+    # --------------------------------------------------------
+    # منع تكرار Transaction ID
+    # --------------------------------------------------------
 
-        # ----------------------------------------------------
-        # TRANSACTIONS
-        # ----------------------------------------------------
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                telegram_id TEXT NOT NULL,
-
-                type TEXT NOT NULL,
-
-                amount REAL NOT NULL,
-
-                status TEXT DEFAULT 'pending',
-
-                reference TEXT,
-
-                verify_request_id TEXT,
-
-                note TEXT,
-
-                created_at TIMESTAMP
-                    DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # ----------------------------------------------------
-        # WITHDRAWALS
-        # ----------------------------------------------------
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                telegram_id TEXT NOT NULL,
-
-                amount REAL NOT NULL,
-
-                phone TEXT,
-
-                status TEXT DEFAULT 'pending',
-
-                note TEXT,
-
-                created_at TIMESTAMP
-                    DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # ----------------------------------------------------
-        # DEPOSIT VERIFICATIONS
-        # ----------------------------------------------------
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS deposits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                telegram_id TEXT NOT NULL,
-
-                reference TEXT UNIQUE,
-
-                bank TEXT,
-
-                amount REAL DEFAULT 0,
-
-                verify_request_id TEXT,
-
-                status TEXT DEFAULT 'pending',
-
-                created_at TIMESTAMP
-                    DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # ----------------------------------------------------
-        # GAME ROUNDS
-        # ----------------------------------------------------
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS game_rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                status TEXT DEFAULT 'waiting',
-
-                players_count INTEGER DEFAULT 0,
-
-                prize_pool REAL DEFAULT 0,
-
-                payout_pool REAL DEFAULT 0,
-
-                winners_count INTEGER DEFAULT 0,
-
-                created_at TIMESTAMP
-                    DEFAULT CURRENT_TIMESTAMP,
-
-                finished_at TIMESTAMP
-            )
-        """)
-
-        # ----------------------------------------------------
-        # GAME PLAYERS
-        # ----------------------------------------------------
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS game_players (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-                round_id INTEGER NOT NULL,
-
-                telegram_id TEXT NOT NULL,
-
-                entry_fee REAL NOT NULL,
-
-                joined_at TIMESTAMP
-                    DEFAULT CURRENT_TIMESTAMP,
-
-                UNIQUE(round_id, telegram_id)
-            )
+    try:
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_deposits_txn_id_unique
+            ON deposits(txn_id)
+            WHERE txn_id IS NOT NULL
+              AND txn_id != ''
         """)
 
         conn.commit()
+
+    except sqlite3.IntegrityError:
+
+        log.exception(
+            "Could not create unique transaction index. "
+            "Existing duplicate txn_id values may exist."
+        )
+
+    conn.close()
+
+
+# ============================================================
+# USERS / BALANCE
+# ============================================================
+
+def get_or_create_user(user_id: int, username: str) -> int:
+
+    conn = db()
+
+    row = conn.execute(
+        "SELECT balance FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+
+    if row is None:
+
+        conn.execute(
+            """
+            INSERT INTO users(user_id, username, balance)
+            VALUES (?, ?, 0)
+            """,
+            (
+                user_id,
+                username or "",
+            )
+        )
+
+        conn.commit()
+
+        balance = 0
+
+    else:
+
+        conn.execute(
+            """
+            UPDATE users
+            SET username=?
+            WHERE user_id=?
+            """,
+            (
+                username or "",
+                user_id,
+            )
+        )
+
+        conn.commit()
+
+        balance = row["balance"]
+
+    conn.close()
+
+    return balance
+
+
+def get_balance(user_id: int) -> int:
+
+    conn = db()
+
+    row = conn.execute(
+        "SELECT balance FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if row is None:
+        return 0
+
+    return int(row["balance"])
+
+
+# ============================================================
+# TELEBIRR VERIFICATION
+# ============================================================
+
+def verify_telebirr_payment(transaction_number: str):
+
+    if not VERIFY_ET_API_KEY:
+
+        return {
+            "ok": False,
+            "reason": "verify_not_configured",
+            "fallback_to_manual": True,
+        }
+
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": VERIFY_ET_API_KEY,
+        "Idempotency-Key": (
+            f"royal-bingo-{uuid.uuid4()}"
+        ),
+    }
+
+
+    body = {
+        "bank": "telebirr",
+        "transactionNumber": transaction_number,
+        "settlementAccount": DEPOSIT_ACCOUNT_NUMBER,
+    }
+
+
+    try:
+
+        resp = requests.post(
+            f"{VERIFY_ET_BASE_URL}/api/verify"
+            f"?waitMs={VERIFY_ET_WAIT_MS}",
+            json=body,
+            headers=headers,
+            timeout=(VERIFY_ET_WAIT_MS / 1000) + 5,
+        )
+
+    except requests.RequestException as e:
+
+        log.warning(
+            "Verify.ET network error: %s",
+            e
+        )
+
+        return {
+            "ok": False,
+            "reason": "network_error",
+            "fallback_to_manual": True,
+        }
+
+
+    if resp.status_code == 202:
+
+        return {
+            "ok": False,
+            "reason": "still_processing",
+            "fallback_to_manual": True,
+        }
+
+
+    if resp.status_code == 401:
+
+        log.error(
+            "Verify.ET invalid API key!"
+        )
+
+        return {
+            "ok": False,
+            "reason": "verify_misconfigured",
+            "fallback_to_manual": True,
+        }
+
+
+    if resp.status_code == 402:
+
+        log.error(
+            "Verify.ET verification credits exhausted!"
+        )
+
+        return {
+            "ok": False,
+            "reason": "verify_credits_exhausted",
+            "fallback_to_manual": True,
+        }
+
+
+    if resp.status_code == 429:
+
+        return {
+            "ok": False,
+            "reason": "rate_limited",
+            "fallback_to_manual": True,
+        }
+
+
+    if resp.status_code != 200:
+
+        log.warning(
+            "Verify.ET unexpected status %s: %s",
+            resp.status_code,
+            resp.text[:300],
+        )
+
+        return {
+            "ok": False,
+            "reason": f"http_{resp.status_code}",
+            "fallback_to_manual": True,
+        }
+
+
+    try:
+
+        payload = resp.json()
+
+    except ValueError:
+
+        return {
+            "ok": False,
+            "reason": "bad_response",
+            "fallback_to_manual": True,
+        }
+
+
+    if not payload.get("success"):
+
+        return {
+            "ok": False,
+            "reason": "verify_failed",
+            "fallback_to_manual": True,
+        }
+
+
+    items = payload.get("data") or []
+
+    if not items:
+
+        return {
+            "ok": False,
+            "reason": "no_data",
+            "fallback_to_manual": True,
+        }
+
+
+    item = items[0]
+
+
+    if not item.get("verified"):
+
+        return {
+            "ok": False,
+            "reason": "not_verified",
+            "fallback_to_manual": False,
+        }
+
+
+    confirmation = (
+        item.get("confirmationHistory")
+        or {}
+    )
+
+
+    if confirmation.get("confirmedBefore"):
+
+        return {
+            "ok": False,
+            "reason": "duplicate_transaction",
+            "fallback_to_manual": False,
+        }
+
+
+    settlement_match = (
+        item.get("settlementAccountMatch")
+    )
+
+
+    if (
+        settlement_match
+        and settlement_match.get("matched") is False
+    ):
+
+        return {
+            "ok": False,
+            "reason": "wrong_recipient",
+            "fallback_to_manual": False,
+        }
+
+
+    amount = item.get("amount")
+
+    if amount is None:
+
+        return {
+            "ok": False,
+            "reason": "missing_verified_amount",
+            "fallback_to_manual": False,
+        }
+
+
+    try:
+
+        verified_amount = int(amount)
+
+    except (TypeError, ValueError):
+
+        return {
+            "ok": False,
+            "reason": "invalid_verified_amount",
+            "fallback_to_manual": False,
+        }
+
+
+    if verified_amount <= 0:
+
+        return {
+            "ok": False,
+            "reason": "invalid_verified_amount",
+            "fallback_to_manual": False,
+        }
+
+
+    return {
+        "ok": True,
+        "amount": verified_amount,
+        "sender_name": item.get("senderName"),
+        "reference": (
+            item.get("referenceNumber")
+            or item.get("transactionNumber")
+            or transaction_number
+        ),
+    }
+
+
+# ============================================================
+# TELEGRAM INIT DATA VALIDATION
+# ============================================================
+
+def validate_init_data(init_data: str):
+
+    try:
+
+        parsed = dict(
+            urllib.parse.parse_qsl(
+                init_data,
+                strict_parsing=True
+            )
+        )
+
+        received_hash = parsed.pop(
+            "hash",
+            None
+        )
+
+        if not received_hash:
+            return None
+
+
+        data_check_string = "\n".join(
+            f"{k}={v}"
+            for k, v in sorted(parsed.items())
+        )
+
+
+        secret_key = hmac.new(
+            b"WebAppData",
+            BOT_TOKEN.encode(),
+            hashlib.sha256,
+        ).digest()
+
+
+        computed_hash = hmac.new(
+            secret_key,
+            data_check_string.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+
+        if not hmac.compare_digest(
+            computed_hash,
+            received_hash
+        ):
+            return None
+
+
+        # ----------------------------------------------------
+        # حماية من Replay Attack
+        # ----------------------------------------------------
+
+        auth_date = parsed.get("auth_date")
+
+        if not auth_date:
+            return None
+
+        try:
+            auth_timestamp = int(auth_date)
+        except ValueError:
+            return None
+
+        # البيانات القديمة جدًا ترفض
+        if abs(time.time() - auth_timestamp) > 86400:
+            return None
+
+
+        user = json.loads(
+            parsed.get(
+                "user",
+                "{}"
+            )
+        )
+
+
+        if "id" not in user:
+            return None
+
+
+        return user
+
+    except Exception:
+
+        return None
+
+
+# ============================================================
+# BINGO ENGINE
+# ============================================================
+
+COLUMN_RANGES = {
+    "B": (1, 15),
+    "I": (16, 30),
+    "N": (31, 45),
+    "G": (46, 60),
+    "O": (61, 75),
+}
+
+
+def generate_grid():
+
+    cols = {}
+
+    for letter, (lo, hi) in COLUMN_RANGES.items():
+
+        need = (
+            4
+            if letter == "N"
+            else 5
+        )
+
+        cols[letter] = random.sample(
+            range(lo, hi + 1),
+            need
+        )
+
+
+    grid = []
+
+
+    for row in range(5):
+
+        line = []
+
+        for letter in ["B", "I", "N", "G", "O"]:
+
+            if (
+                letter == "N"
+                and row == 2
+            ):
+
+                line.append("FREE")
+
+            else:
+
+                idx = (
+                    row - 1
+                    if letter == "N" and row > 2
+                    else row
+                )
+
+                line.append(
+                    cols[letter][idx]
+                )
+
+        grid.append(line)
+
+
+    return grid
+
+
+def check_grid_win(grid, called_set):
+
+    def marked(r, c):
+
+        value = grid[r][c]
+
+        return (
+            value == "FREE"
+            or value in called_set
+        )
+
+
+    # rows
+
+    for r in range(5):
+
+        if all(
+            marked(r, c)
+            for c in range(5)
+        ):
+            return True
+
+
+    # columns
+
+    for c in range(5):
+
+        if all(
+            marked(r, c)
+            for r in range(5)
+        ):
+            return True
+
+
+    # diagonal
+
+    if all(
+        marked(i, i)
+        for i in range(5)
+    ):
+        return True
+
+
+    # reverse diagonal
+
+    if all(
+        marked(i, 4 - i)
+        for i in range(5)
+    ):
+        return True
+
+
+    return False
+
+
+# ============================================================
+# ROUND MANAGEMENT
+# ============================================================
+
+def get_or_create_active_round():
+
+    conn = db()
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM rounds
+        WHERE status IN ('collecting', 'active')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+    if row is None:
+
+        close_at = (
+            time.time()
+            + COLLECT_SECONDS
+        )
+
+
+        conn.execute(
+            """
+            INSERT INTO rounds(
+                status,
+                close_at,
+                called_balls,
+                prize_pool,
+                created_at
+            )
+            VALUES (
+                'collecting',
+                ?,
+                '[]',
+                0,
+                ?
+            )
+            """,
+            (
+                close_at,
+                datetime.utcnow().isoformat(),
+            )
+        )
+
+
+        conn.commit()
+
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM rounds
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+    conn.close()
+
+    return row
+
+
+# ============================================================
+# ROUND ENGINE TICK
+# ============================================================
+
+def round_engine_tick():
+
+    with _db_lock:
+
+        conn = db()
+
+        rnd = conn.execute(
+            """
+            SELECT *
+            FROM rounds
+            WHERE status IN ('collecting', 'active')
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+        now = time.time()
+
+
+        if rnd is None:
+
+            conn.close()
+
+            get_or_create_active_round()
+
+            return
+
+
+        # ====================================================
+        # 1. CLOSE COLLECTION
+        # ====================================================
+
+        if (
+            rnd["status"] == "collecting"
+            and now >= rnd["close_at"]
+        ):
+
+            sequence = list(
+                range(1, 76)
+            )
+
+            random.shuffle(sequence)
+
+
+            conn.execute(
+                """
+                UPDATE rounds
+                SET
+                    status='active',
+                    ball_sequence=?,
+                    active_started_at=?,
+                    next_ball_at=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(sequence),
+                    now,
+                    now,
+                    rnd["id"],
+                )
+            )
+
+
+            conn.commit()
+
+            conn.close()
+
+            log.info(
+                "Round %s started. Prize pool: %s ETB",
+                rnd["id"],
+                rnd["prize_pool"],
+            )
+
+            return
+
+
+        # ====================================================
+        # 2. DRAW NEXT BALL
+        # ====================================================
+
+        if (
+            rnd["status"] == "active"
+            and now >= rnd["next_ball_at"]
+        ):
+
+            sequence = json.loads(
+                rnd["ball_sequence"]
+            )
+
+            called = json.loads(
+                rnd["called_balls"]
+            )
+
+
+            if len(called) >= 75:
+
+                conn.execute(
+                    """
+                    UPDATE rounds
+                    SET
+                        status='finished',
+                        finished_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        now,
+                        rnd["id"],
+                    )
+                )
+
+                conn.commit()
+
+                conn.close()
+
+                get_or_create_active_round()
+
+                return
+
+
+            next_ball = sequence[
+                len(called)
+            ]
+
+            called.append(next_ball)
+
+            called_set = set(called)
+
+
+            log.info(
+                "Round %s ball: %s",
+                rnd["id"],
+                next_ball,
+            )
+
+
+            entries = conn.execute(
+                """
+                SELECT *
+                FROM round_entries
+                WHERE round_id=?
+                """,
+                (rnd["id"],)
+            ).fetchall()
+
+
+            winners = []
+
+
+            for entry in entries:
+
+                grid = json.loads(
+                    entry["grid"]
+                )
+
+                if check_grid_win(
+                    grid,
+                    called_set
+                ):
+
+                    winners.append(entry)
+
+
+            # =================================================
+            # FIRST BINGO
+            # =================================================
+
+            if winners:
+
+                pool = int(
+                    rnd["prize_pool"]
+                )
+
+
+                share = (
+                    pool // len(winners)
+                    if winners
+                    else 0
+                )
+
+
+                log.info(
+                    "Round %s FINISHED. "
+                    "Ball=%s Winners=%s Pool=%s Share=%s",
+                    rnd["id"],
+                    next_ball,
+                    len(winners),
+                    pool,
+                    share,
+                )
+
+
+                for winner in winners:
+
+                    conn.execute(
+                        """
+                        UPDATE round_entries
+                        SET
+                            is_winner=1,
+                            payout=?
+                        WHERE id=?
+                        """,
+                        (
+                            share,
+                            winner["id"],
+                        )
+                    )
+
+
+                    conn.execute(
+                        """
+                        UPDATE users
+                        SET balance = balance + ?
+                        WHERE user_id=?
+                        """,
+                        (
+                            share,
+                            winner["user_id"],
+                        )
+                    )
+
+
+                conn.execute(
+                    """
+                    UPDATE rounds
+                    SET
+                        called_balls=?,
+                        status='finished',
+                        finished_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        json.dumps(called),
+                        now,
+                        rnd["id"],
+                    )
+                )
+
+
+                conn.commit()
+
+                conn.close()
+
+
+                # الجولة التالية
+                get_or_create_active_round()
+
+                return
+
+
+            # =================================================
+            # NO WINNER YET
+            # =================================================
+
+            if len(called) >= 75:
+
+                conn.execute(
+                    """
+                    UPDATE rounds
+                    SET
+                        called_balls=?,
+                        status='finished',
+                        finished_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        json.dumps(called),
+                        now,
+                        rnd["id"],
+                    )
+                )
+
+
+                conn.commit()
+
+                conn.close()
+
+                get_or_create_active_round()
+
+                return
+
+
+            # =================================================
+            # CONTINUE
+            # =================================================
+
+            conn.execute(
+                """
+                UPDATE rounds
+                SET
+                    called_balls=?,
+                    next_ball_at=?
+                WHERE id=?
+                """,
+                (
+                    json.dumps(called),
+                    now + BALL_DRAW_SECONDS,
+                    rnd["id"],
+                )
+            )
+
+
+            conn.commit()
+
+            conn.close()
+
+            return
+
+
         conn.close()
 
-    logger.info(
-        "Database initialized: %s",
-        DB_PATH
+
+# ============================================================
+# ROUND LOOP
+# ============================================================
+
+def round_engine_loop():
+
+    log.info(
+        "Royal Bingo Round Engine started."
+    )
+
+
+    while True:
+
+        try:
+
+            round_engine_tick()
+
+        except Exception as e:
+
+            log.exception(
+                "round_engine_tick error: %s",
+                e
+            )
+
+
+        time.sleep(1)
+
+
+# ============================================================
+# FLASK
+# ============================================================
+
+app = Flask(__name__)
+
+app.config[
+    "MAX_CONTENT_LENGTH"
+] = 8 * 1024 * 1024
+
+
+# ============================================================
+# RAW TELEGRAM BOT
+# ============================================================
+
+_raw_bot = Bot(
+    token=BOT_TOKEN
+)
+
+
+def send_admin_message_sync(
+    text,
+    reply_markup=None
+):
+
+    return asyncio.run(
+        _raw_bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=text,
+            reply_markup=reply_markup,
+        )
+    )
+
+
+def send_user_message_sync(
+    user_id,
+    text
+):
+
+    try:
+
+        asyncio.run(
+            _raw_bot.send_message(
+                chat_id=user_id,
+                text=text,
+            )
+        )
+
+    except Exception as e:
+
+        log.warning(
+            "send_user_message_sync failed: %s",
+            e
+        )
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+@app.after_request
+def add_cors(resp):
+
+    resp.headers[
+        "Access-Control-Allow-Origin"
+    ] = "*"
+
+    resp.headers[
+        "Access-Control-Allow-Headers"
+    ] = "Content-Type"
+
+    resp.headers[
+        "Access-Control-Allow-Methods"
+    ] = "GET,POST,OPTIONS"
+
+    return resp
+
+
+@app.route(
+    "/api/<path:_any>",
+    methods=["OPTIONS"]
+)
+def cors_preflight(_any):
+
+    return ("", 204)
+
+
+# ============================================================
+# AUTH
+# ============================================================
+
+def auth_or_error(payload):
+
+    user = validate_init_data(
+        payload.get(
+            "initData",
+            ""
+        )
+    )
+
+
+    if user is None:
+
+        return None, (
+            jsonify(
+                {
+                    "error":
+                    "invalid_init_data"
+                }
+            ),
+            401,
+        )
+
+
+    return user, None
+
+
+# ============================================================
+# API AUTH
+# ============================================================
+
+@app.route(
+    "/api/auth",
+    methods=["POST"]
+)
+def api_auth():
+
+    payload = request.get_json(
+        force=True
+    )
+
+    user, err = auth_or_error(
+        payload
+    )
+
+    if err:
+        return err
+
+
+    balance = get_or_create_user(
+        user["id"],
+        user.get("username")
+    )
+
+
+    return jsonify(
+        {
+            "user_id": user["id"],
+            "username": user.get(
+                "username"
+            ),
+            "balance": balance,
+        }
     )
 
 
 # ============================================================
-# USERS
+# PUBLIC ROUND STATE
 # ============================================================
 
-def ensure_user(
-    telegram_id,
-    username=None,
-    first_name=None,
-    referred_by=None
+def round_to_public_dict(
+    rnd,
+    entries_for_user=None
 ):
 
-    telegram_id = str(telegram_id)
+    now = time.time()
 
-    with db_lock:
 
-        conn = get_db()
-        cur = conn.cursor()
+    out = {
+        "round_id": rnd["id"],
+        "status": rnd["status"],
+        "prize_pool": rnd["prize_pool"],
+        "called_balls": json.loads(
+            rnd["called_balls"]
+        ),
+    }
 
-        cur.execute(
-            """
-            SELECT telegram_id
-            FROM users
-            WHERE telegram_id = ?
-            """,
-            (telegram_id,)
+
+    if rnd["status"] == "collecting":
+
+        out["closes_in"] = max(
+            0,
+            round(
+                rnd["close_at"] - now
+            )
         )
 
-        exists = cur.fetchone()
 
-        if not exists:
+    if entries_for_user is not None:
 
-            referral_code = (
-                "RB" + telegram_id
+        out["your_entries"] = [
+            {
+                "grid": json.loads(
+                    e["grid"]
+                ),
+                "is_winner": bool(
+                    e["is_winner"]
+                ),
+                "payout": e["payout"],
+            }
+            for e in entries_for_user
+        ]
+
+
+    return out
+
+
+# ============================================================
+# CURRENT ROUND
+# ============================================================
+
+@app.route(
+    "/api/round/current",
+    methods=["POST"]
+)
+def api_round_current():
+
+    payload = request.get_json(
+        force=True
+    )
+
+    user, err = auth_or_error(
+        payload
+    )
+
+    if err:
+        return err
+
+
+    rnd = get_or_create_active_round()
+
+
+    conn = db()
+
+    entries = conn.execute(
+        """
+        SELECT *
+        FROM round_entries
+        WHERE round_id=?
+          AND user_id=?
+        """,
+        (
+            rnd["id"],
+            user["id"],
+        )
+    ).fetchall()
+
+
+    conn.close()
+
+
+    return jsonify(
+        round_to_public_dict(
+            rnd,
+            entries
+        )
+    )
+
+
+# ============================================================
+# JOIN ROUND
+# ============================================================
+
+@app.route(
+    "/api/round/join",
+    methods=["POST"]
+)
+def api_round_join():
+
+    payload = request.get_json(
+        force=True
+    )
+
+    user, err = auth_or_error(
+        payload
+    )
+
+    if err:
+        return err
+
+
+    try:
+
+        count = int(
+            payload.get(
+                "count",
+                1
             )
+        )
 
-            cur.execute(
+    except (TypeError, ValueError):
+
+        return jsonify(
+            {
+                "error":
+                "invalid_count"
+            }
+        ), 400
+
+
+    if count < 1:
+
+        return jsonify(
+            {
+                "error":
+                "invalid_count"
+            }
+        ), 400
+
+
+    if count > MAX_CARTELAS:
+
+        return jsonify(
+            {
+                "error":
+                "max_cartelas_exceeded",
+                "max":
+                MAX_CARTELAS,
+            }
+        ), 400
+
+
+    with _db_lock:
+
+        conn = db()
+
+
+        rnd = conn.execute(
+            """
+            SELECT *
+            FROM rounds
+            WHERE status='collecting'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+        if rnd is None:
+
+            conn.close()
+
+            return jsonify(
+                {
+                    "error":
+                    "no_open_round"
+                }
+            ), 400
+
+
+        # ----------------------------------------------------
+        # تأكد أن نافذة الانضمام لم تنته فعليًا
+        # ----------------------------------------------------
+
+        if time.time() >= rnd["close_at"]:
+
+            conn.close()
+
+            return jsonify(
+                {
+                    "error":
+                    "round_closing"
+                }
+            ), 400
+
+
+        existing = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM round_entries
+            WHERE round_id=?
+              AND user_id=?
+            """,
+            (
+                rnd["id"],
+                user["id"],
+            )
+        ).fetchone()["c"]
+
+
+        if existing + count > MAX_CARTELAS:
+
+            conn.close()
+
+            return jsonify(
+                {
+                    "error":
+                    "max_cartelas_exceeded",
+                    "max":
+                    MAX_CARTELAS,
+                    "already":
+                    existing,
+                }
+            ), 400
+
+
+        cost = (
+            ENTRY_STAKE * count
+        )
+
+
+        bal_row = conn.execute(
+            """
+            SELECT balance
+            FROM users
+            WHERE user_id=?
+            """,
+            (user["id"],)
+        ).fetchone()
+
+
+        balance = (
+            bal_row["balance"]
+            if bal_row
+            else 0
+        )
+
+
+        if balance < cost:
+
+            conn.close()
+
+            return jsonify(
+                {
+                    "error":
+                    "insufficient_balance",
+                    "balance":
+                    balance,
+                    "needed":
+                    cost,
+                }
+            ), 400
+
+
+        # ----------------------------------------------------
+        # الخصم
+        # ----------------------------------------------------
+
+        conn.execute(
+            """
+            UPDATE users
+            SET balance = balance - ?
+            WHERE user_id=?
+            """,
+            (
+                cost,
+                user["id"],
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # 80% Prize Pool
+        # ----------------------------------------------------
+
+        pool_add = int(
+            cost * PAYOUT_RATIO
+        )
+
+
+        conn.execute(
+            """
+            UPDATE rounds
+            SET prize_pool =
+                prize_pool + ?
+            WHERE id=?
+            """,
+            (
+                pool_add,
+                rnd["id"],
+            )
+        )
+
+
+        new_grids = []
+
+
+        for _ in range(count):
+
+            grid = generate_grid()
+
+
+            conn.execute(
                 """
-                INSERT INTO users (
-                    telegram_id,
+                INSERT INTO round_entries(
+                    round_id,
+                    user_id,
                     username,
-                    first_name,
-                    referral_code,
-                    referred_by
+                    grid,
+                    stake_paid
                 )
-
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    telegram_id,
-                    username,
-                    first_name,
-                    referral_code,
-                    referred_by
+                    rnd["id"],
+                    user["id"],
+                    user.get(
+                        "username"
+                    ),
+                    json.dumps(grid),
+                    ENTRY_STAKE,
                 )
             )
 
-        else:
 
-            cur.execute(
-                """
-                UPDATE users
+            new_grids.append(grid)
 
-                SET username = ?,
-                    first_name = ?
-
-                WHERE telegram_id = ?
-                """,
-                (
-                    username,
-                    first_name,
-                    telegram_id
-                )
-            )
 
         conn.commit()
+
+
+        new_balance = (
+            balance - cost
+        )
+
+
         conn.close()
 
 
-def get_user(telegram_id):
+    return jsonify(
+        {
+            "ok": True,
+            "grids": new_grids,
+            "balance": new_balance,
+            "round_id": rnd["id"],
+        }
+    )
 
-    with db_lock:
 
-        conn = get_db()
-        cur = conn.cursor()
+# ============================================================
+# ROUND STATE
+# ============================================================
 
-        cur.execute(
+@app.route(
+    "/api/round/state",
+    methods=["POST"]
+)
+def api_round_state():
+
+    payload = request.get_json(
+        force=True
+    )
+
+    user, err = auth_or_error(
+        payload
+    )
+
+    if err:
+        return err
+
+
+    try:
+
+        round_id = int(
+            payload.get(
+                "round_id"
+            )
+        )
+
+    except (TypeError, ValueError):
+
+        return jsonify(
+            {
+                "error":
+                "invalid_round_id"
+            }
+        ), 400
+
+
+    conn = db()
+
+
+    rnd = conn.execute(
+        """
+        SELECT *
+        FROM rounds
+        WHERE id=?
+        """,
+        (round_id,)
+    ).fetchone()
+
+
+    if rnd is None:
+
+        conn.close()
+
+        return jsonify(
+            {
+                "error":
+                "round_not_found"
+            }
+        ), 404
+
+
+    entries = conn.execute(
+        """
+        SELECT *
+        FROM round_entries
+        WHERE round_id=?
+          AND user_id=?
+        """,
+        (
+            round_id,
+            user["id"],
+        )
+    ).fetchall()
+
+
+    balance_row = conn.execute(
+        """
+        SELECT balance
+        FROM users
+        WHERE user_id=?
+        """,
+        (user["id"],)
+    ).fetchone()
+
+
+    balance = (
+        balance_row["balance"]
+        if balance_row
+        else 0
+    )
+
+
+    conn.close()
+
+
+    result = round_to_public_dict(
+        rnd,
+        entries
+    )
+
+
+    result["balance"] = balance
+
+
+    return jsonify(result)
+
+
+# ============================================================
+# DEPOSIT API
+# ============================================================
+
+@app.route(
+    "/api/deposit/submit",
+    methods=["POST"]
+)
+def api_deposit_submit():
+
+    payload = request.get_json(
+        force=True
+    )
+
+    user, err = auth_or_error(
+        payload
+    )
+
+    if err:
+        return err
+
+
+    txn_id = str(
+        payload.get(
+            "txn_id",
+            ""
+        )
+    ).strip()
+
+
+    if not txn_id:
+
+        return jsonify(
+            {
+                "error":
+                "missing_txn_id"
+            }
+        ), 400
+
+
+    try:
+
+        claimed_amount = int(
+            payload.get(
+                "amount",
+                0
+            )
+        )
+
+    except (TypeError, ValueError):
+
+        claimed_amount = 0
+
+
+    # --------------------------------------------------------
+    # تحقق محلي أولًا
+    # --------------------------------------------------------
+
+    with _db_lock:
+
+        conn = db()
+
+        existing = conn.execute(
             """
             SELECT *
-            FROM users
-            WHERE telegram_id = ?
+            FROM deposits
+            WHERE txn_id=?
+            LIMIT 1
             """,
-            (str(telegram_id),)
-        )
-
-        user = cur.fetchone()
+            (txn_id,)
+        ).fetchone()
 
         conn.close()
 
-    return user
+
+    if existing:
+
+        if existing["status"] == "completed":
+
+            return jsonify(
+                {
+                    "error":
+                    "duplicate_transaction"
+                }
+            ), 400
+
+        return jsonify(
+            {
+                "error":
+                "transaction_already_submitted",
+                "status":
+                existing["status"],
+            }
+        ), 400
 
 
-def get_balance(telegram_id):
+    # --------------------------------------------------------
+    # Verify.ET
+    # --------------------------------------------------------
 
-    user = get_user(telegram_id)
-
-    if not user:
-        return 0.0
-
-    return float(user["balance"])
+    result = verify_telebirr_payment(
+        txn_id
+    )
 
 
-# ============================================================
-# BALANCE
-# ============================================================
+    # ========================================================
+    # VERIFIED
+    # ========================================================
 
-def credit_balance(
-    telegram_id,
-    amount,
-    transaction_type,
-    note="",
-    reference=None,
-    verify_request_id=None
-):
+    if result["ok"]:
 
-    amount = float(amount)
+        verified_amount = int(
+            result["amount"]
+        )
 
-    if amount <= 0:
-        return None
 
-    telegram_id = str(telegram_id)
+        with _db_lock:
 
-    with db_lock:
+            conn = db()
 
-        conn = get_db()
-        cur = conn.cursor()
+            # فحص نهائي ضد race condition
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM deposits
+                WHERE txn_id=?
+                LIMIT 1
+                """,
+                (txn_id,)
+            ).fetchone()
 
-        cur.execute(
-            """
-            UPDATE users
 
-            SET balance = balance + ?,
+            if existing:
 
-                total_deposit =
-                    CASE
-                        WHEN ? = 'deposit'
-                        THEN total_deposit + ?
-                        ELSE total_deposit
-                    END,
+                conn.close()
 
-                total_won =
-                    CASE
-                        WHEN ? = 'prize'
-                        THEN total_won + ?
-                        ELSE total_won
-                    END
+                return jsonify(
+                    {
+                        "error":
+                        "duplicate_transaction"
+                    }
+                ), 400
 
-            WHERE telegram_id = ?
-            """,
-            (
-                amount,
-                transaction_type,
-                amount,
-                transaction_type,
-                amount,
-                telegram_id
+
+            cur = conn.execute(
+                """
+                INSERT INTO deposits(
+                    user_id,
+                    username,
+                    amount,
+                    method,
+                    txn_id,
+                    photo_file_id,
+                    status,
+                    created_at
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, 'completed', ?
+                )
+                """,
+                (
+                    user["id"],
+                    user.get(
+                        "username",
+                        ""
+                    ),
+                    verified_amount,
+                    DEPOSIT_METHOD,
+                    txn_id,
+                    None,
+                    datetime.utcnow().isoformat(),
+                )
             )
-        )
 
-        cur.execute(
-            """
-            INSERT INTO transactions (
-                telegram_id,
-                type,
-                amount,
-                status,
-                reference,
-                verify_request_id,
-                note
+
+            dep_id = cur.lastrowid
+
+
+            conn.execute(
+                """
+                UPDATE users
+                SET balance =
+                    balance + ?
+                WHERE user_id=?
+                """,
+                (
+                    verified_amount,
+                    user["id"],
+                )
             )
 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                telegram_id,
-                transaction_type,
-                amount,
-                "completed",
-                reference,
-                verify_request_id,
-                note
+
+            balance_row = conn.execute(
+                """
+                SELECT balance
+                FROM users
+                WHERE user_id=?
+                """,
+                (user["id"],)
+            ).fetchone()
+
+
+            new_balance = (
+                balance_row["balance"]
+                if balance_row
+                else 0
             )
-        )
-
-        conn.commit()
-
-        cur.execute(
-            """
-            SELECT balance
-            FROM users
-            WHERE telegram_id = ?
-            """,
-            (telegram_id,)
-        )
-
-        row = cur.fetchone()
-
-        conn.close()
-
-    if not row:
-        return None
-
-    return float(row["balance"])
 
 
-def debit_balance(
-    telegram_id,
-    amount,
-    transaction_type,
-    note=""
-):
-
-    amount = float(amount)
-
-    if amount <= 0:
-        return None
-
-    telegram_id = str(telegram_id)
-
-    with db_lock:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT balance
-            FROM users
-            WHERE telegram_id = ?
-            """,
-            (telegram_id,)
-        )
-
-        row = cur.fetchone()
-
-        if not row:
+            conn.commit()
 
             conn.close()
 
-            return None
 
-        balance = float(row["balance"])
+        send_admin_message_sync(
+            f"✅ Auto-Verified Deposit #{dep_id}\n\n"
+            f"Player: @{user.get('username') or user['id']} "
+            f"(ID: {user['id']})\n"
+            f"Amount: {verified_amount} ETB\n"
+            f"Sender: {result.get('sender_name', '?')}\n"
+            f"Txn: {txn_id}\n\n"
+            f"Balance: {new_balance} ETB"
+        )
 
-        if balance < amount:
+
+        return jsonify(
+            {
+                "ok": True,
+                "status":
+                "completed",
+                "credited_amount":
+                verified_amount,
+                "balance":
+                new_balance,
+            }
+        )
+
+
+    # ========================================================
+    # HARD REJECT
+    # ========================================================
+
+    if not result.get(
+        "fallback_to_manual"
+    ):
+
+        return jsonify(
+            {
+                "error":
+                result["reason"]
+            }
+        ), 400
+
+
+    # ========================================================
+    # MANUAL FALLBACK
+    # ========================================================
+
+    with _db_lock:
+
+        conn = db()
+
+
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM deposits
+            WHERE txn_id=?
+            LIMIT 1
+            """,
+            (txn_id,)
+        ).fetchone()
+
+
+        if existing:
 
             conn.close()
 
-            return False
+            return jsonify(
+                {
+                    "error":
+                    "transaction_already_submitted"
+                }
+            ), 400
 
-        cur.execute(
+
+        cur = conn.execute(
             """
-            UPDATE users
-
-            SET balance = balance - ?,
-
-                total_withdraw =
-                    CASE
-                        WHEN ? = 'withdraw'
-                        THEN total_withdraw + ?
-                        ELSE total_withdraw
-                    END
-
-            WHERE telegram_id = ?
-            """,
-            (
+            INSERT INTO deposits(
+                user_id,
+                username,
                 amount,
-                transaction_type,
-                amount,
-                telegram_id
-            )
-        )
-
-        cur.execute(
-            """
-            INSERT INTO transactions (
-                telegram_id,
-                type,
-                amount,
+                method,
+                txn_id,
+                photo_file_id,
                 status,
-                note
+                created_at
             )
-
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (
+                ?, ?, ?, ?, ?, ?, 'pending', ?
+            )
             """,
             (
-                telegram_id,
-                transaction_type,
-                amount,
-                "completed",
-                note
+                user["id"],
+                user.get(
+                    "username",
+                    ""
+                ),
+                claimed_amount,
+                DEPOSIT_METHOD,
+                txn_id,
+                None,
+                datetime.utcnow().isoformat(),
             )
         )
+
+
+        dep_id = cur.lastrowid
 
         conn.commit()
 
-        cur.execute(
-            """
-            SELECT balance
-            FROM users
-            WHERE telegram_id = ?
-            """,
-            (telegram_id,)
+        conn.close()
+
+
+    caption = (
+        f"⚠️ Deposit #{dep_id}\n\n"
+        f"Auto verification unavailable: "
+        f"{result['reason']}\n\n"
+        f"Player: @{user.get('username') or user['id']} "
+        f"(ID: {user['id']})\n"
+        f"Claimed Amount: {claimed_amount} ETB\n"
+        f"Method: {DEPOSIT_METHOD}\n"
+        f"Transaction ID: {txn_id}\n\n"
+        f"Status: pending"
+    )
+
+
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "✅ ቀበል",
+                callback_data=f"dep_ok_{dep_id}"
+            ),
+            InlineKeyboardButton(
+                "✕ ውድቅ",
+                callback_data=f"dep_no_{dep_id}"
+            ),
+        ]]
+    )
+
+
+    try:
+
+        msg = send_admin_message_sync(
+            caption,
+            kb
         )
 
-        new_row = cur.fetchone()
+
+        conn = db()
+
+        conn.execute(
+            """
+            UPDATE deposits
+            SET
+                admin_msg_chat_id=?,
+                admin_msg_id=?
+            WHERE id=?
+            """,
+            (
+                msg.chat_id,
+                msg.message_id,
+                dep_id,
+            )
+        )
+
+
+        conn.commit()
 
         conn.close()
 
-    return float(new_row["balance"])
+
+    except Exception as e:
+
+        log.exception(
+            "Failed to notify admin of deposit #%s: %s",
+            dep_id,
+            e
+        )
+
+
+    return jsonify(
+        {
+            "ok": True,
+            "status": "pending",
+            "deposit_id": dep_id,
+        }
+    )
 
 
 # ============================================================
-# TELEGRAM MENU
+# WITHDRAW API
 # ============================================================
+
+@app.route(
+    "/api/withdraw/submit",
+    methods=["POST"]
+)
+def api_withdraw_submit():
+
+    payload = request.get_json(
+        force=True
+    )
+
+    user, err = auth_or_error(
+        payload
+    )
+
+    if err:
+        return err
+
+
+    try:
+
+        amount = int(
+            payload.get(
+                "amount",
+                0
+            )
+        )
+
+    except (TypeError, ValueError):
+
+        return jsonify(
+            {
+                "error":
+                "invalid_amount"
+            }
+        ), 400
+
+
+    if amount <= 0:
+
+        return jsonify(
+            {
+                "error":
+                "invalid_amount"
+            }
+        ), 400
+
+
+    account = str(
+        payload.get(
+            "account",
+            ""
+        )
+    ).strip()
+
+
+    if not account:
+
+        return jsonify(
+            {
+                "error":
+                "missing_account"
+            }
+        ), 400
+
+
+    with _db_lock:
+
+        conn = db()
+
+
+        balance_row = conn.execute(
+            """
+            SELECT balance
+            FROM users
+            WHERE user_id=?
+            """,
+            (user["id"],)
+        ).fetchone()
+
+
+        current_balance = (
+            balance_row["balance"]
+            if balance_row
+            else 0
+        )
+
+
+        if amount > current_balance:
+
+            conn.close()
+
+            return jsonify(
+                {
+                    "error":
+                    "insufficient_balance",
+                    "balance":
+                    current_balance,
+                }
+            ), 400
+
+
+        cur = conn.execute(
+            """
+            INSERT INTO withdrawals(
+                user_id,
+                username,
+                amount,
+                method,
+                account,
+                status,
+                created_at
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, 'pending', ?
+            )
+            """,
+            (
+                user["id"],
+                user.get(
+                    "username",
+                    ""
+                ),
+                amount,
+                DEPOSIT_METHOD,
+                account,
+                datetime.utcnow().isoformat(),
+            )
+        )
+
+
+        wd_id = cur.lastrowid
+
+
+        conn.commit()
+
+        conn.close()
+
+
+    text = (
+        f"💸 Withdrawal #{wd_id}\n\n"
+        f"Player: @{user.get('username') or user['id']} "
+        f"(ID: {user['id']})\n"
+        f"Amount: {amount} ETB\n"
+        f"Method: {DEPOSIT_METHOD}\n"
+        f"Account: {account}\n"
+        f"Current Balance: {current_balance} ETB\n\n"
+        f"Status: pending"
+    )
+
+
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "✅ ተከፍሏል",
+                callback_data=f"wd_ok_{wd_id}"
+            ),
+            InlineKeyboardButton(
+                "✕ ውድቅ",
+                callback_data=f"wd_no_{wd_id}"
+            ),
+        ]]
+    )
+
+
+    try:
+
+        msg = send_admin_message_sync(
+            text,
+            kb
+        )
+
+
+        conn = db()
+
+        conn.execute(
+            """
+            UPDATE withdrawals
+            SET
+                admin_msg_chat_id=?,
+                admin_msg_id=?
+            WHERE id=?
+            """,
+            (
+                msg.chat_id,
+                msg.message_id,
+                wd_id,
+            )
+        )
+
+
+        conn.commit()
+
+        conn.close()
+
+
+    except Exception as e:
+
+        log.exception(
+            "Failed to notify admin of withdrawal #%s: %s",
+            wd_id,
+            e
+        )
+
+
+    return jsonify(
+        {
+            "ok": True,
+            "withdrawal_id": wd_id,
+        }
+    )
+
+
+# ============================================================
+# TELEGRAM BOT
+# ============================================================
+
+BTN_PLAY = "🎰 ጨዋታ ጀምር"
+
+BTN_DEPOSIT = "💰 ገንዘብ ማስገባት"
+
+BTN_WITHDRAW = "💸 ገንዘብ ማውጣት"
+
+BTN_BALANCE = "💳 ቀሪ ሂሳብ"
+
+BTN_SUPPORT = "🆘 ድጋፍ"
+
 
 def main_menu():
 
-    return InlineKeyboardMarkup([
-
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "🎮 ጨዋታ",
-                web_app=WebAppInfo(
-                    url=WEBAPP_URL
+            [
+                KeyboardButton(
+                    BTN_PLAY,
+                    web_app=WebAppInfo(
+                        url=WEBAPP_URL
+                    )
                 )
-            )
+            ],
+            [
+                BTN_DEPOSIT,
+                BTN_WITHDRAW
+            ],
+            [
+                BTN_BALANCE,
+                BTN_SUPPORT
+            ],
         ],
+        resize_keyboard=True,
+    )
 
-        [
-            InlineKeyboardButton(
-                "💰 ገንዘብ አስገባ",
-                callback_data="deposit"
-            ),
 
-            InlineKeyboardButton(
-                "💸 ገንዘብ አውጣ",
-                callback_data="withdraw"
-            )
-        ],
+def cancel_kb():
 
-        [
-            InlineKeyboardButton(
-                "👥 ግብዣ",
-                callback_data="referral"
-            ),
+    return ReplyKeyboardMarkup(
+        [["/cancel"]],
+        resize_keyboard=True
+    )
 
-            InlineKeyboardButton(
-                "🆘 ድጋፍ",
-                callback_data="support"
-            )
-        ]
-    ])
+
+def is_admin(uid: int):
+
+    return uid in ADMIN_IDS
 
 
 # ============================================================
@@ -653,1594 +2526,1179 @@ async def start(
 
     user = update.effective_user
 
-    referred_by = None
 
-    if context.args:
-
-        referred_by = context.args[0]
-
-    ensure_user(
+    get_or_create_user(
         user.id,
-        user.username,
-        user.first_name,
-        referred_by
+        user.username
     )
 
-    balance = get_balance(user.id)
-
-    text = f"""
-🎱 <b>ሮያል ቢንጎ</b>
-
-እንኳን ወደ Royal Bingo በደህና መጡ! 🎉
-
-💰 የእርስዎ ቀሪ ሂሳብ:
-<b>{balance:.2f} ETB</b>
-
-🎟️ የጨዋታ መግቢያ:
-<b>{ENTRY_FEE:.2f} ETB</b>
-
-ከታች ያለውን ምናሌ ይጠቀሙ።
-"""
 
     await update.message.reply_text(
-        text,
-        reply_markup=main_menu(),
-        parse_mode="HTML"
+        "👑 ወደ ROYAL BINGO እንኳን በደህና መጡ!\n\n"
+        "ከታች ካለው ሜኑ ይምረጡ፦",
+        reply_markup=main_menu()
     )
 
 
 # ============================================================
-# DEPOSIT INSTRUCTIONS
+# BALANCE
 # ============================================================
 
-async def show_deposit(
-    query,
-    context
+async def show_balance(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    text = f"""
-💰 <b>ገንዘብ አስገባ</b>
+    bal = get_balance(
+        update.effective_user.id
+    )
 
-1️⃣ ወደዚህ የክፍያ ቁጥር ገንዘብ ይላኩ፦
 
-📱 <code>{DEPOSIT_PHONE}</code>
-
-2️⃣ ክፍያው ከተጠናቀቀ በኋላ የTransaction Number / Reference ይላኩ።
-
-3️⃣ Royal Bingo ክፍያውን በVerify.ET ያረጋግጣል።
-
-4️⃣ ከተረጋገጠ በኋላ ገንዘቡ በራስ-ሰር ወደ ሂሳብዎ ይጨመራል።
-
-🏦 Bank:
-<b>{DEPOSIT_BANK}</b>
-"""
-
-    await query.message.reply_text(
-        text,
-        parse_mode="HTML"
+    await update.message.reply_text(
+        f"💳 ቀሪ ሂሳብዎ፦ {bal} ETB",
+        reply_markup=main_menu()
     )
 
 
 # ============================================================
-# WITHDRAW INSTRUCTIONS
+# SUPPORT
 # ============================================================
 
-async def show_withdraw(
-    query,
-    user_id
+async def show_support(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    balance = get_balance(user_id)
-
-    text = f"""
-💸 <b>ገንዘብ አውጣ</b>
-
-💰 የአሁኑ ሂሳብ:
-<b>{balance:.2f} ETB</b>
-
-የሚፈልጉትን የWithdrawal መጠን ይላኩ።
-
-ምሳሌ:
-<code>100</code>
-
-ከዚያ የሚቀበሉበትን የስልክ ቁጥር ይላኩ።
-"""
-
-    await query.message.reply_text(
-        text,
-        parse_mode="HTML"
+    await update.message.reply_text(
+        f"🆘 ለማንኛውም ጥያቄ እባክዎ ያግኙን፦ "
+        f"{SUPPORT_CONTACT}",
+        reply_markup=main_menu()
     )
 
 
 # ============================================================
-# REFERRAL
+# DEPOSIT START
 # ============================================================
 
-async def show_referral(
-    query,
-    context,
-    user_id
+async def deposit_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    user = get_user(user_id)
+    await update.message.reply_text(
 
-    code = user["referral_code"]
+        "ገንዘብ ለማስገባት ወደ ሚከተለው "
+        "አካውንት ይላኩ፦\n\n"
 
-    bot_username = context.bot.username
+        f"💳 ዘዴ፦ {DEPOSIT_METHOD}\n"
+        f"👤 ስም፦ {DEPOSIT_ACCOUNT_NAME}\n"
+        f"📱 ቁጥር፦ {DEPOSIT_ACCOUNT_NUMBER}\n\n"
 
-    link = (
-        f"https://t.me/{bot_username}"
-        f"?start={code}"
+        "ከላኩ በኋላ የላኩትን "
+        "መጠን (በ ETB) ያስገቡ፦\n\n"
+
+        "(ለመሰረዝ /cancel ይጫኑ)",
+
+        reply_markup=cancel_kb()
     )
 
-    earnings = float(
-        user["referral_earnings"]
-    )
 
-    text = f"""
-👥 <b>ግብዣ</b>
-
-ጓደኞችዎን Royal Bingo እንዲጫወቱ ይጋብዙ።
-
-🔗 የእርስዎ የግብዣ ሊንክ:
-
-<code>{link}</code>
-
-💎 የReferral ገቢ:
-
-<b>{earnings:.2f} ETB</b>
-"""
-
-    await query.message.reply_text(
-        text,
-        parse_mode="HTML"
-    )
+    return DEP_AMOUNT
 
 
 # ============================================================
-# BUTTON HANDLER
+# DEPOSIT AMOUNT
 # ============================================================
 
-async def button_handler(
+async def deposit_amount(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = update.message.text.strip()
+
+
+    if (
+        not text.isdigit()
+        or int(text) <= 0
+    ):
+
+        await update.message.reply_text(
+            "እባክዎ ትክክለኛ ቁጥር "
+            "ያስገቡ (ምሳሌ፦ 100)፦"
+        )
+
+        return DEP_AMOUNT
+
+
+    context.user_data[
+        "dep_amount"
+    ] = int(text)
+
+
+    await update.message.reply_text(
+        "እባክዎ የግብይት ቁጥር "
+        "(Transaction ID) ያስገቡ፦"
+    )
+
+
+    return DEP_TXNID
+
+
+# ============================================================
+# DEPOSIT TXN ID
+# ============================================================
+
+async def deposit_txnid(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    txn_id = update.message.text.strip()
+
+    claimed_amount = context.user_data.get(
+        "dep_amount",
+        0
+    )
+
+
+    await update.message.reply_text(
+        "⏳ በመጣራት ላይ... "
+        "ትንሽ ይጠብቁ።"
+    )
+
+
+    # لا نجمد Telegram event loop
+    result = await asyncio.to_thread(
+        verify_telebirr_payment,
+        txn_id
+    )
+
+
+    # ========================================================
+    # VERIFIED
+    # ========================================================
+
+    if result["ok"]:
+
+        verified_amount = int(
+            result["amount"]
+        )
+
+
+        with _db_lock:
+
+            conn = db()
+
+
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM deposits
+                WHERE txn_id=?
+                LIMIT 1
+                """,
+                (txn_id,)
+            ).fetchone()
+
+
+            if existing:
+
+                conn.close()
+
+                await update.message.reply_text(
+                    "❌ ይህ የግብይት ቁጥር "
+                    "ቀድሞ ጥቅም ላይ ውሏል።",
+                    reply_markup=main_menu()
+                )
+
+                context.user_data.clear()
+
+                return ConversationHandler.END
+
+
+            cur = conn.execute(
+                """
+                INSERT INTO deposits(
+                    user_id,
+                    username,
+                    amount,
+                    method,
+                    txn_id,
+                    photo_file_id,
+                    status,
+                    created_at
+                )
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, 'completed', ?
+                )
+                """,
+                (
+                    user.id,
+                    user.username or "",
+                    verified_amount,
+                    DEPOSIT_METHOD,
+                    txn_id,
+                    None,
+                    datetime.utcnow().isoformat(),
+                )
+            )
+
+
+            dep_id = cur.lastrowid
+
+
+            conn.execute(
+                """
+                UPDATE users
+                SET balance =
+                    balance + ?
+                WHERE user_id=?
+                """,
+                (
+                    verified_amount,
+                    user.id,
+                )
+            )
+
+
+            balance_row = conn.execute(
+                """
+                SELECT balance
+                FROM users
+                WHERE user_id=?
+                """,
+                (user.id,)
+            ).fetchone()
+
+
+            new_balance = (
+                balance_row["balance"]
+                if balance_row
+                else 0
+            )
+
+
+            conn.commit()
+
+            conn.close()
+
+
+        await update.message.reply_text(
+            f"🎉 ተረጋግጧል! "
+            f"{verified_amount} ETB "
+            f"ወደ ሂሳብዎ ገብቷል።\n"
+            f"ቀሪ ሂሳብ፦ "
+            f"{new_balance} ETB",
+            reply_markup=main_menu()
+        )
+
+
+        try:
+
+            await context.bot.send_message(
+                ADMIN_CHAT_ID,
+                f"✅ Auto-Verified Deposit #{dep_id}\n"
+                f"Player: @{user.username or user.id} "
+                f"(ID: {user.id})\n"
+                f"Amount: {verified_amount} ETB\n"
+                f"Sender: {result.get('sender_name', '?')}\n"
+                f"Txn: {txn_id}\n"
+                f"Balance: {new_balance} ETB"
+            )
+
+        except Exception as e:
+
+            log.warning(
+                "notify admin failed: %s",
+                e
+            )
+
+
+        context.user_data.clear()
+
+        return ConversationHandler.END
+
+
+    # ========================================================
+    # HARD REJECT
+    # ========================================================
+
+    if not result.get(
+        "fallback_to_manual"
+    ):
+
+        reason_text = {
+
+            "not_verified":
+                "ይህ የግብይት ቁጥር "
+                "ትክክል አይደለም።",
+
+            "duplicate_transaction":
+                "ይህ ግብይት ቀደም ብሎ "
+                "ጥቅም ላይ ውሏል።",
+
+            "wrong_recipient":
+                "ይህ ክፍያ ወደ እኛ "
+                "አካውንት አልደረሰም۔",
+
+        }.get(
+            result["reason"],
+            "ማረጋገጫው አልተሳካም።"
+        )
+
+
+        await update.message.reply_text(
+            f"❌ {reason_text}\n"
+            f"እባክዎ ትክክለኛ መረጃ "
+            f"በድጋሚ ያስገቡ ወይም "
+            f"{SUPPORT_CONTACT} ያግኙ።",
+            reply_markup=main_menu()
+        )
+
+
+        context.user_data.clear()
+
+        return ConversationHandler.END
+
+
+    # ========================================================
+    # MANUAL FALLBACK
+    # ========================================================
+
+    with _db_lock:
+
+        conn = db()
+
+
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM deposits
+            WHERE txn_id=?
+            LIMIT 1
+            """,
+            (txn_id,)
+        ).fetchone()
+
+
+        if existing:
+
+            conn.close()
+
+            await update.message.reply_text(
+                "❌ ይህ የግብይት ቁጥር "
+                "ቀድሞ ቀርቧል።",
+                reply_markup=main_menu()
+            )
+
+            context.user_data.clear()
+
+            return ConversationHandler.END
+
+
+        cur = conn.execute(
+            """
+            INSERT INTO deposits(
+                user_id,
+                username,
+                amount,
+                method,
+                txn_id,
+                photo_file_id,
+                status,
+                created_at
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, ?, 'pending', ?
+            )
+            """,
+            (
+                user.id,
+                user.username or "",
+                claimed_amount,
+                DEPOSIT_METHOD,
+                txn_id,
+                None,
+                datetime.utcnow().isoformat(),
+            )
+        )
+
+
+        dep_id = cur.lastrowid
+
+
+        conn.commit()
+
+        conn.close()
+
+
+    caption = (
+        f"⚠️ Deposit #{dep_id}\n\n"
+        f"Auto verification unavailable: "
+        f"{result['reason']}\n\n"
+        f"Player: @{user.username or user.id} "
+        f"(ID: {user.id})\n"
+        f"Claimed Amount: {claimed_amount} ETB\n"
+        f"Method: {DEPOSIT_METHOD}\n"
+        f"Transaction ID: {txn_id}\n\n"
+        f"Status: pending"
+    )
+
+
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "✅ ቀበል",
+                callback_data=f"dep_ok_{dep_id}"
+            ),
+            InlineKeyboardButton(
+                "✕ ውድቅ",
+                callback_data=f"dep_no_{dep_id}"
+            ),
+        ]]
+    )
+
+
+    msg = await context.bot.send_message(
+        ADMIN_CHAT_ID,
+        caption,
+        reply_markup=kb
+    )
+
+
+    conn = db()
+
+    conn.execute(
+        """
+        UPDATE deposits
+        SET
+            admin_msg_chat_id=?,
+            admin_msg_id=?
+        WHERE id=?
+        """,
+        (
+            msg.chat_id,
+            msg.message_id,
+            dep_id,
+        )
+    )
+
+
+    conn.commit()
+
+    conn.close()
+
+
+    await update.message.reply_text(
+        f"✅ ጥያቄዎ (#{dep_id}) ደርሷል፣ "
+        f"በእጅ በመታየት ላይ ነው።",
+        reply_markup=main_menu()
+    )
+
+
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# WITHDRAW START
+# ============================================================
+
+async def withdraw_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    bal = get_balance(
+        update.effective_user.id
+    )
+
+
+    if bal <= 0:
+
+        await update.message.reply_text(
+            "በቂ ቀሪ ሂሳብ የለዎትም።",
+            reply_markup=main_menu()
+        )
+
+        return ConversationHandler.END
+
+
+    await update.message.reply_text(
+        f"ቀሪ ሂሳብዎ፦ {bal} ETB\n\n"
+        "ምን ያህል ማውጣት ይፈልጋሉ? "
+        "(በ ETB)፦\n\n"
+        "(ለመሰረዝ /cancel ይጫኑ)",
+        reply_markup=cancel_kb()
+    )
+
+
+    return WD_AMOUNT
+
+
+# ============================================================
+# WITHDRAW AMOUNT
+# ============================================================
+
+async def withdraw_amount(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = update.message.text.strip()
+
+
+    if (
+        not text.isdigit()
+        or int(text) <= 0
+    ):
+
+        await update.message.reply_text(
+            "እባክዎ ትክክለኛ ቁጥር "
+            "ያስገቡ፦"
+        )
+
+        return WD_AMOUNT
+
+
+    amount = int(text)
+
+
+    bal = get_balance(
+        update.effective_user.id
+    )
+
+
+    if amount > bal:
+
+        await update.message.reply_text(
+            f"በቂ ቀሪ ሂሳብ የለዎትም። "
+            f"ቀሪ ሂሳብዎ፦ {bal} ETB\n\n"
+            "ሌላ መጠን ያስገቡ፦"
+        )
+
+        return WD_AMOUNT
+
+
+    context.user_data[
+        "wd_amount"
+    ] = amount
+
+
+    await update.message.reply_text(
+        f"ገንዘቡ የሚላክበትን "
+        f"የ{DEPOSIT_METHOD} ስልክ ቁጥር "
+        f"ያስገቡ፦"
+    )
+
+
+    return WD_PHONE
+
+
+# ============================================================
+# WITHDRAW PHONE
+# ============================================================
+
+async def withdraw_phone(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    account = update.message.text.strip()
+
+    user = update.effective_user
+
+    amount = context.user_data[
+        "wd_amount"
+    ]
+
+
+    with _db_lock:
+
+        conn = db()
+
+
+        balance_row = conn.execute(
+            """
+            SELECT balance
+            FROM users
+            WHERE user_id=?
+            """,
+            (user.id,)
+        ).fetchone()
+
+
+        current_balance = (
+            balance_row["balance"]
+            if balance_row
+            else 0
+        )
+
+
+        if amount > current_balance:
+
+            conn.close()
+
+            await update.message.reply_text(
+                "❌ በቂ ቀሪ ሂሳብ የለዎትም።",
+                reply_markup=main_menu()
+            )
+
+            context.user_data.clear()
+
+            return ConversationHandler.END
+
+
+        cur = conn.execute(
+            """
+            INSERT INTO withdrawals(
+                user_id,
+                username,
+                amount,
+                method,
+                account,
+                status,
+                created_at
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, 'pending', ?
+            )
+            """,
+            (
+                user.id,
+                user.username or "",
+                amount,
+                DEPOSIT_METHOD,
+                account,
+                datetime.utcnow().isoformat(),
+            )
+        )
+
+
+        wd_id = cur.lastrowid
+
+
+        conn.commit()
+
+        conn.close()
+
+
+    text = (
+        f"💸 Withdrawal #{wd_id}\n\n"
+        f"Player: @{user.username or user.id} "
+        f"(ID: {user.id})\n"
+        f"Amount: {amount} ETB\n"
+        f"Method: {DEPOSIT_METHOD}\n"
+        f"Account: {account}\n"
+        f"Current Balance: {current_balance} ETB\n\n"
+        f"Status: pending"
+    )
+
+
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "✅ ተከፍሏል",
+                callback_data=f"wd_ok_{wd_id}"
+            ),
+            InlineKeyboardButton(
+                "✕ ውድቅ",
+                callback_data=f"wd_no_{wd_id}"
+            ),
+        ]]
+    )
+
+
+    msg = await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=text,
+        reply_markup=kb
+    )
+
+
+    conn = db()
+
+    conn.execute(
+        """
+        UPDATE withdrawals
+        SET
+            admin_msg_chat_id=?,
+            admin_msg_id=?
+        WHERE id=?
+        """,
+        (
+            msg.chat_id,
+            msg.message_id,
+            wd_id,
+        )
+    )
+
+
+    conn.commit()
+
+    conn.close()
+
+
+    await update.message.reply_text(
+        f"✅ የማውጣት ጥያቄዎ (#{wd_id}) ደርሷል።\n"
+        "አድሚን እስኪያረጋግጥ "
+        "በመጠባበቅ ላይ ነው። "
+        "ቀሪ ሂሳብዎ እስከዚያ ድረስ "
+        "አይቀየርም።",
+        reply_markup=main_menu()
+    )
+
+
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# CANCEL
+# ============================================================
+
+async def cancel_conv(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    context.user_data.clear()
+
+
+    await update.message.reply_text(
+        "ተሰርዟል።",
+        reply_markup=main_menu()
+    )
+
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# DEPOSIT ADMIN CALLBACK
+# ============================================================
+
+async def handle_deposit_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
 
-    await query.answer()
 
-    user = query.from_user
+    if not is_admin(
+        query.from_user.id
+    ):
 
-    ensure_user(
-        user.id,
-        user.username,
-        user.first_name
+        await query.answer(
+            "⛔ You are not authorized.",
+            show_alert=True
+        )
+
+        return
+
+
+    parts = query.data.split("_")
+
+    action = parts[1]
+
+    dep_id = int(parts[2])
+
+    approve = (
+        action == "ok"
     )
 
-    if query.data == "deposit":
 
-        await show_deposit(
-            query,
-            context
-        )
+    with _db_lock:
 
-    elif query.data == "withdraw":
-
-        await show_withdraw(
-            query,
-            user.id
-        )
-
-    elif query.data == "referral":
-
-        await show_referral(
-            query,
-            context,
-            user.id
-        )
-
-    elif query.data == "support":
-
-        await query.message.reply_text(
-            f"""
-🆘 <b>ድጋፍ</b>
-
-ችግር ካጋጠመዎት የSupport ቡድናችንን ያነጋግሩ።
-
-📩 {SUPPORT_USERNAME}
-""",
-            parse_mode="HTML"
-        )
+        conn = db()
 
 
-# ============================================================
-# VERIFY.ET
-# ============================================================
-
-def verify_payment(
-    reference,
-    bank=None
-):
-
-    if not VERIFY_ET_API_KEY:
-
-        return {
-            "success": False,
-            "error": "VERIFY_ET_API_KEY is not configured"
-        }
-
-    bank = bank or DEPOSIT_BANK
-
-    url = (
-        VERIFY_ET_BASE_URL
-        + "/api/verify"
-    )
-
-    payload = {
-        "bank": bank,
-        "reference": reference,
-    }
-
-    # Telebirr uses transactionNumber.
-    if bank == "telebirr":
-
-        payload = {
-            "bank": "telebirr",
-            "transactionNumber": reference,
-            "settlementAccount": DEPOSIT_PHONE
-        }
-
-    # MPESA
-    elif bank == "mpesa":
-
-        payload = {
-            "bank": "mpesa",
-            "transactionNumber": reference,
-            "settlementAccount": DEPOSIT_PHONE
-        }
-
-    # CBE Birr
-    elif bank == "cbebirr":
-
-        payload = {
-            "bank": "cbebirr",
-            "receiptNumber": reference,
-            "phoneNumber": DEPOSIT_PHONE,
-            "settlementAccount": DEPOSIT_PHONE
-        }
-
-    # CBE
-    elif bank == "cbe":
-
-        suffix = os.getenv(
-            "DEPOSIT_ACCOUNT_SUFFIX",
-            ""
-        )
-
-        payload = {
-            "bank": "cbe",
-            "referenceNumber": reference,
-            "accountSuffix": suffix
-        }
-
-    # BOA
-    elif bank == "boa":
-
-        suffix = os.getenv(
-            "DEPOSIT_ACCOUNT_SUFFIX",
-            ""
-        )
-
-        payload = {
-            "bank": "boa",
-            "referenceNumber": reference,
-            "accountSuffix": suffix
-        }
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": VERIFY_ET_API_KEY,
-        "Idempotency-Key":
-            "royal-bingo-" + str(uuid.uuid4())
-    }
-
-    try:
-
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            params={"waitMs": 5000},
-            timeout=20
-        )
-
-        try:
-            data = response.json()
-
-        except Exception:
-
-            return {
-                "success": False,
-                "error": "Invalid Verify.ET response",
-                "http_status":
-                    response.status_code
-            }
-
-        return {
-            "success":
-                bool(
-                    data.get("success")
-                ),
-
-            "http_status":
-                response.status_code,
-
-            "data":
-                data
-        }
-
-    except requests.RequestException as exc:
-
-        logger.exception(
-            "Verify.ET request failed"
-        )
-
-        return {
-            "success": False,
-            "error": str(exc)
-        }
-
-
-# ============================================================
-# DEPOSIT API
-# ============================================================
-
-@app.post("/api/deposit/verify")
-def api_deposit_verify():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    telegram_id = data.get(
-        "telegram_id"
-    )
-
-    reference = data.get(
-        "reference"
-    )
-
-    bank = data.get(
-        "bank",
-        DEPOSIT_BANK
-    )
-
-    if not telegram_id:
-
-        return jsonify({
-            "success": False,
-            "error": "telegram_id required"
-        }), 400
-
-    if not reference:
-
-        return jsonify({
-            "success": False,
-            "error": "reference required"
-        }), 400
-
-    ensure_user(telegram_id)
-
-    reference = str(reference).strip()
-
-    # --------------------------------------------------------
-    # Prevent duplicate deposits
-    # --------------------------------------------------------
-
-    with db_lock:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute(
+        dep = conn.execute(
             """
             SELECT *
             FROM deposits
-            WHERE reference = ?
+            WHERE id=?
+              AND status='pending'
             """,
-            (reference,)
+            (dep_id,)
+        ).fetchone()
+
+
+        if dep is None:
+
+            conn.close()
+
+            await query.answer(
+                "⚠️ Already handled.",
+                show_alert=True
+            )
+
+            return
+
+
+        new_status = (
+            "completed"
+            if approve
+            else "rejected"
         )
 
-        existing = cur.fetchone()
+
+        conn.execute(
+            """
+            UPDATE deposits
+            SET status=?
+            WHERE id=?
+            """,
+            (
+                new_status,
+                dep_id,
+            )
+        )
+
+
+        old_balance = get_balance(
+            dep["user_id"]
+        )
+
+
+        if approve:
+
+            conn.execute(
+                """
+                UPDATE users
+                SET balance =
+                    balance + ?
+                WHERE user_id=?
+                """,
+                (
+                    dep["amount"],
+                    dep["user_id"],
+                )
+            )
+
+
+        conn.commit()
+
+
+        new_balance = get_balance(
+            dep["user_id"]
+        )
+
 
         conn.close()
 
-    if existing:
 
-        return jsonify({
-            "success": False,
-            "error": "transaction_already_used"
-        }), 409
-
-    # --------------------------------------------------------
-    # Verify
-    # --------------------------------------------------------
-
-    result = verify_payment(
-        reference,
-        bank
+    status_line = (
+        "✅ ACCEPTED"
+        if approve
+        else
+        "❌ REJECTED"
     )
 
-    if not result.get("success"):
 
-        return jsonify({
-            "success": False,
-            "error": result.get(
-                "error",
-                "verification_failed"
-            ),
-            "verify": result
-        }), 400
-
-    raw = result.get(
-        "data",
-        {}
+    new_caption = (
+        f"💰 Deposit #{dep_id}\n\n"
+        f"Player: @{dep['username'] or dep['user_id']} "
+        f"(ID: {dep['user_id']})\n"
+        f"Amount: {dep['amount']} ETB\n"
+        f"Method: {dep['method']}\n"
+        f"Transaction ID: {dep['txn_id']}\n\n"
+        f"Status: {status_line}"
     )
 
-    verification = raw.get(
-        "verification",
-        {}
-    )
 
-    status = verification.get(
-        "status"
-    )
+    if approve:
 
-    verified = verification.get(
-        "verified",
-        False
-    )
-
-    request_id = raw.get(
-        "requestId"
-    )
-
-    items = raw.get(
-        "data",
-        []
-    )
-
-    amount = 0
-
-    if items:
-
-        amount = float(
-            items[0].get(
-                "amount",
-                0
-            ) or 0
+        new_caption += (
+            f"\nBalance: "
+            f"{old_balance} → "
+            f"{new_balance} ETB"
         )
 
-    # --------------------------------------------------------
-    # Completed
-    # --------------------------------------------------------
 
-    if verified and status == "success":
+    await query.edit_message_text(
+        text=new_caption
+    )
 
-        if amount <= 0:
 
-            return jsonify({
-                "success": False,
-                "error": "invalid_verified_amount"
-            }), 400
+    await query.answer(
+        "Done ✅"
+    )
 
-        # Settlement account protection
-        if items:
 
-            match = items[0].get(
-                "settlementAccountMatch"
+    try:
+
+        if approve:
+
+            await context.bot.send_message(
+                dep["user_id"],
+                f"🎉 የክፍያ ጥያቄዎ "
+                f"(#{dep_id}) ተቀባይነት አግኝቷል!\n"
+                f"ቀሪ ሂሳብዎ፦ "
+                f"{old_balance} → "
+                f"{new_balance} ETB"
             )
 
-            if match:
+        else:
 
-                if not match.get(
-                    "matched",
-                    False
-                ):
+            await context.bot.send_message(
+                dep["user_id"],
+                f"❌ የክፍያ ጥያቄዎ "
+                f"(#{dep_id}) ውድቅ ተደርጓል።\n"
+                f"ለበለጠ መረጃ "
+                f"{SUPPORT_CONTACT} ያግኙ።"
+            )
 
-                    return jsonify({
-                        "success": False,
-                        "error":
-                            "receiver_account_mismatch"
-                    }), 400
 
-        with db_lock:
+    except Exception as e:
 
-            conn = get_db()
-            cur = conn.cursor()
+        log.warning(
+            "notify failed: %s",
+            e
+        )
 
-            cur.execute(
+
+# ============================================================
+# WITHDRAW ADMIN CALLBACK
+# ============================================================
+
+async def handle_withdrawal_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+
+    if not is_admin(
+        query.from_user.id
+    ):
+
+        await query.answer(
+            "⛔ You are not authorized.",
+            show_alert=True
+        )
+
+        return
+
+
+    parts = query.data.split("_")
+
+    action = parts[1]
+
+    wd_id = int(parts[2])
+
+    approve = (
+        action == "ok"
+    )
+
+
+    with _db_lock:
+
+        conn = db()
+
+
+        wd = conn.execute(
+            """
+            SELECT *
+            FROM withdrawals
+            WHERE id=?
+              AND status='pending'
+            """,
+            (wd_id,)
+        ).fetchone()
+
+
+        if wd is None:
+
+            conn.close()
+
+            await query.answer(
+                "⚠️ Already handled.",
+                show_alert=True
+            )
+
+            return
+
+
+        if approve:
+
+            bal_row = conn.execute(
                 """
-                INSERT INTO deposits (
-                    telegram_id,
-                    reference,
-                    bank,
-                    amount,
-                    verify_request_id,
-                    status
+                SELECT balance
+                FROM users
+                WHERE user_id=?
+                """,
+                (wd["user_id"],)
+            ).fetchone()
+
+
+            bal = (
+                bal_row["balance"]
+                if bal_row
+                else 0
+            )
+
+
+            if bal < wd["amount"]:
+
+                conn.close()
+
+                await query.answer(
+                    f"⚠️ Insufficient balance! "
+                    f"Current: {bal} ETB",
+                    show_alert=True
                 )
 
-                VALUES (?, ?, ?, ?, ?, ?)
+                return
+
+
+            conn.execute(
+                """
+                UPDATE users
+                SET balance =
+                    balance - ?
+                WHERE user_id=?
                 """,
                 (
-                    str(telegram_id),
-                    reference,
-                    bank,
-                    amount,
-                    request_id,
-                    "completed"
+                    wd["amount"],
+                    wd["user_id"],
                 )
             )
+
+
+            conn.execute(
+                """
+                UPDATE withdrawals
+                SET status='completed'
+                WHERE id=?
+                """,
+                (wd_id,)
+            )
+
 
             conn.commit()
 
-            conn.close()
 
-        new_balance = credit_balance(
-            telegram_id,
-            amount,
-            "deposit",
-            "Verified deposit",
-            reference,
-            request_id
+            new_balance = get_balance(
+                wd["user_id"]
+            )
+
+
+        else:
+
+            conn.execute(
+                """
+                UPDATE withdrawals
+                SET status='rejected'
+                WHERE id=?
+                """,
+                (wd_id,)
+            )
+
+
+            conn.commit()
+
+            new_balance = None
+
+
+        conn.close()
+
+
+    status_line = (
+        "✅ PAID"
+        if approve
+        else
+        "❌ REJECTED"
+    )
+
+
+    new_text = (
+        f"💸 Withdrawal #{wd_id}\n\n"
+        f"Player: @{wd['username'] or wd['user_id']} "
+        f"(ID: {wd['user_id']})\n"
+        f"Amount: {wd['amount']} ETB\n"
+        f"Method: {wd['method']}\n"
+        f"Account: {wd['account']}\n\n"
+        f"Status: {status_line}"
+    )
+
+
+    if approve:
+
+        new_text += (
+            f"\nRemaining Balance: "
+            f"{new_balance} ETB"
         )
 
-        return jsonify({
+    else:
 
-            "success": True,
-
-            "status": "completed",
-
-            "amount": amount,
-
-            "balance": new_balance,
-
-            "reference": reference,
-
-            "request_id": request_id
-        })
-
-    # --------------------------------------------------------
-    # Pending / queued
-    # --------------------------------------------------------
-
-    return jsonify({
-
-        "success": True,
-
-        "status": "pending",
-
-        "request_id": request_id,
-
-        "message":
-            "Verification is still processing."
-    }), 202
+        new_text += (
+            "\nBalance unchanged"
+        )
 
 
-# ============================================================
-# WALLET
-# ============================================================
-
-@app.get("/api/wallet")
-def api_wallet():
-
-    telegram_id = request.args.get(
-        "telegram_id"
+    await query.edit_message_text(
+        text=new_text
     )
 
-    if not telegram_id:
 
-        return jsonify({
-            "success": False,
-            "error": "telegram_id required"
-        }), 400
-
-    user = get_user(telegram_id)
-
-    if not user:
-
-        return jsonify({
-            "success": False,
-            "error": "user not found"
-        }), 404
-
-    return jsonify({
-
-        "success": True,
-
-        "telegram_id":
-            str(telegram_id),
-
-        "username":
-            user["username"],
-
-        "balance":
-            float(user["balance"]),
-
-        "total_deposit":
-            float(user["total_deposit"]),
-
-        "total_withdraw":
-            float(user["total_withdraw"]),
-
-        "total_won":
-            float(user["total_won"]),
-
-        "referral_earnings":
-            float(
-                user["referral_earnings"]
-            )
-    })
-
-
-# ============================================================
-# USER
-# ============================================================
-
-@app.post("/api/user")
-def api_user():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    telegram_id = data.get(
-        "telegram_id"
+    await query.answer(
+        "Done ✅"
     )
 
-    if not telegram_id:
 
-        return jsonify({
-            "success": False,
-            "error": "telegram_id required"
-        }), 400
+    try:
 
-    ensure_user(
-        telegram_id,
-        data.get("username"),
-        data.get("first_name")
-    )
+        if approve:
 
-    user = get_user(
-        telegram_id
-    )
-
-    return jsonify({
-
-        "success": True,
-
-        "telegram_id":
-            str(telegram_id),
-
-        "username":
-            user["username"],
-
-        "first_name":
-            user["first_name"],
-
-        "balance":
-            float(user["balance"]),
-
-        "entry_fee":
-            ENTRY_FEE,
-
-        "max_players":
-            MAX_PLAYERS
-    })
-
-
-# ============================================================
-# GAME CONFIG
-# ============================================================
-
-@app.get("/api/game/config")
-def game_config():
-
-    return jsonify({
-
-        "success": True,
-
-        "entry_fee":
-            ENTRY_FEE,
-
-        "max_players":
-            MAX_PLAYERS,
-
-        "prize_percent":
-            PRIZE_PERCENT,
-
-        "currency":
-            "ETB"
-    })
-
-
-# ============================================================
-# JOIN GAME
-# ============================================================
-
-@app.post("/api/game/join")
-def game_join():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    telegram_id = data.get(
-        "telegram_id"
-    )
-
-    round_id = data.get(
-        "round_id"
-    )
-
-    if not telegram_id:
-
-        return jsonify({
-            "success": False,
-            "error": "telegram_id required"
-        }), 400
-
-    ensure_user(telegram_id)
-
-    # --------------------------------------------------------
-    # Find / create round
-    # --------------------------------------------------------
-
-    with db_lock:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        if round_id:
-
-            cur.execute(
-                """
-                SELECT *
-                FROM game_rounds
-                WHERE id = ?
-                """,
-                (round_id,)
+            await context.bot.send_message(
+                wd["user_id"],
+                f"✅ የማውጣት ጥያቄዎ "
+                f"(#{wd_id}) ተልኳል!\n"
+                f"የተላከ መጠን፦ "
+                f"{wd['amount']} ETB\n"
+                f"ቀሪ ሂሳብ፦ "
+                f"{new_balance} ETB"
             )
 
         else:
 
-            cur.execute(
-                """
-                SELECT *
-                FROM game_rounds
-                WHERE status = 'waiting'
-                ORDER BY id DESC
-                LIMIT 1
-                """
+            await context.bot.send_message(
+                wd["user_id"],
+                f"❌ የማውጣት ጥያቄዎ "
+                f"(#{wd_id}) ውድቅ ተደርጓል።\n"
+                f"ቀሪ ሂሳብዎ አልተቀየረም።"
             )
 
-        game_round = cur.fetchone()
 
-        if not game_round:
+    except Exception as e:
 
-            cur.execute(
-                """
-                INSERT INTO game_rounds (
-                    status,
-                    players_count,
-                    prize_pool
-                )
-
-                VALUES (?, ?, ?)
-                """,
-                (
-                    "waiting",
-                    0,
-                    0
-                )
-            )
-
-            round_id = cur.lastrowid
-
-            cur.execute(
-                """
-                SELECT *
-                FROM game_rounds
-                WHERE id = ?
-                """,
-                (round_id,)
-            )
-
-            game_round = cur.fetchone()
-
-        else:
-
-            round_id = game_round["id"]
-
-        # ----------------------------------------------------
-        # Already joined?
-        # ----------------------------------------------------
-
-        cur.execute(
-            """
-            SELECT id
-            FROM game_players
-
-            WHERE round_id = ?
-            AND telegram_id = ?
-            """,
-            (
-                round_id,
-                str(telegram_id)
-            )
+        log.warning(
+            "notify failed: %s",
+            e
         )
 
-        already = cur.fetchone()
-
-        if already:
-
-            conn.close()
-
-            return jsonify({
-                "success": True,
-                "already_joined": True,
-                "round_id": round_id,
-                "balance":
-                    get_balance(telegram_id)
-            })
-
-        # ----------------------------------------------------
-        # Check balance INSIDE transaction lock
-        # ----------------------------------------------------
-
-        cur.execute(
-            """
-            SELECT balance
-            FROM users
-            WHERE telegram_id = ?
-            """,
-            (str(telegram_id),)
-        )
-
-        user = cur.fetchone()
-
-        balance = float(
-            user["balance"]
-        )
-
-        if balance < ENTRY_FEE:
-
-            conn.close()
-
-            return jsonify({
-
-                "success": False,
-
-                "error":
-                    "insufficient_balance",
-
-                "balance":
-                    balance,
-
-                "entry_fee":
-                    ENTRY_FEE
-            }), 400
-
-        # ----------------------------------------------------
-        # Deduct entry
-        # ----------------------------------------------------
-
-        cur.execute(
-            """
-            UPDATE users
-
-            SET balance =
-                balance - ?
-
-            WHERE telegram_id = ?
-            """,
-            (
-                ENTRY_FEE,
-                str(telegram_id)
-            )
-        )
-
-        cur.execute(
-            """
-            INSERT INTO transactions (
-                telegram_id,
-                type,
-                amount,
-                status,
-                note
-            )
-
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                str(telegram_id),
-                "game_entry",
-                ENTRY_FEE,
-                "completed",
-                f"Round {round_id}"
-            )
-        )
-
-        cur.execute(
-            """
-            INSERT INTO game_players (
-                round_id,
-                telegram_id,
-                entry_fee
-            )
-
-            VALUES (?, ?, ?)
-            """,
-            (
-                round_id,
-                str(telegram_id),
-                ENTRY_FEE
-            )
-        )
-
-        cur.execute(
-            """
-            UPDATE game_rounds
-
-            SET players_count =
-                    players_count + 1,
-
-                prize_pool =
-                    prize_pool + ?
-
-            WHERE id = ?
-            """,
-            (
-                ENTRY_FEE,
-                round_id
-            )
-        )
-
-        conn.commit()
-
-        cur.execute(
-            """
-            SELECT balance
-            FROM users
-            WHERE telegram_id = ?
-            """,
-            (str(telegram_id),)
-        )
-
-        new_balance = float(
-            cur.fetchone()["balance"]
-        )
-
-        conn.close()
-
-    return jsonify({
-
-        "success": True,
-
-        "round_id":
-            round_id,
-
-        "entry_fee":
-            ENTRY_FEE,
-
-        "balance":
-            new_balance
-    })
-
 
 # ============================================================
-# PRIZE
+# BUILD BOT
 # ============================================================
 
-@app.post("/api/prize")
-def api_prize():
-
-    admin_token = request.headers.get(
-        "X-Admin-Token"
-    )
-
-    if not ADMIN_TOKEN:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "ADMIN_TOKEN not configured"
-        }), 500
-
-    if admin_token != ADMIN_TOKEN:
-
-        return jsonify({
-            "success": False,
-            "error": "unauthorized"
-        }), 401
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    telegram_id = data.get(
-        "telegram_id"
-    )
-
-    amount = data.get(
-        "amount"
-    )
-
-    round_id = data.get(
-        "round_id"
-    )
-
-    if not telegram_id or amount is None:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "telegram_id and amount required"
-        }), 400
-
-    try:
-
-        amount = float(amount)
-
-    except (
-        TypeError,
-        ValueError
-    ):
-
-        return jsonify({
-            "success": False,
-            "error": "invalid amount"
-        }), 400
-
-    if amount <= 0:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "amount must be positive"
-        }), 400
-
-    ensure_user(telegram_id)
-
-    new_balance = credit_balance(
-        telegram_id,
-        amount,
-        "prize",
-        f"Royal Bingo prize - round {round_id}"
-    )
-
-    return jsonify({
-
-        "success": True,
-
-        "telegram_id":
-            str(telegram_id),
-
-        "prize":
-            amount,
-
-        "balance":
-            new_balance,
-
-        "round_id":
-            round_id
-    })
-
-
-# ============================================================
-# ROUND PRIZE CALCULATION
-# ============================================================
-
-@app.get("/api/game/round/<int:round_id>")
-def get_round(round_id):
-
-    with db_lock:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT *
-            FROM game_rounds
-            WHERE id = ?
-            """,
-            (round_id,)
-        )
-
-        round_data = cur.fetchone()
-
-        if not round_data:
-
-            conn.close()
-
-            return jsonify({
-                "success": False,
-                "error": "round not found"
-            }), 404
-
-        conn.close()
-
-    prize_pool = float(
-        round_data["prize_pool"]
-    )
-
-    payout_pool = (
-        prize_pool *
-        PRIZE_PERCENT /
-        100
-    )
-
-    return jsonify({
-
-        "success": True,
-
-        "round_id":
-            round_id,
-
-        "status":
-            round_data["status"],
-
-        "players_count":
-            round_data["players_count"],
-
-        "prize_pool":
-            prize_pool,
-
-        "payout_pool":
-            payout_pool,
-
-        "prize_percent":
-            PRIZE_PERCENT
-    })
-
-
-# ============================================================
-# WITHDRAW REQUEST
-# ============================================================
-
-@app.post("/api/withdraw")
-def api_withdraw():
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    telegram_id = data.get(
-        "telegram_id"
-    )
-
-    amount = data.get(
-        "amount"
-    )
-
-    phone = data.get(
-        "phone"
-    )
-
-    if not telegram_id:
-        return jsonify({
-            "success": False,
-            "error":
-                "telegram_id required"
-        }), 400
-
-    if amount is None:
-        return jsonify({
-            "success": False,
-            "error":
-                "amount required"
-        }), 400
-
-    if not phone:
-        return jsonify({
-            "success": False,
-            "error":
-                "phone required"
-        }), 400
-
-    try:
-
-        amount = float(amount)
-
-    except (
-        TypeError,
-        ValueError
-    ):
-
-        return jsonify({
-            "success": False,
-            "error":
-                "invalid amount"
-        }), 400
-
-    if amount <= 0:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "amount must be positive"
-        }), 400
-
-    ensure_user(telegram_id)
-
-    # --------------------------------------------------------
-    # Reserve balance
-    # --------------------------------------------------------
-
-    new_balance = debit_balance(
-        telegram_id,
-        amount,
-        "withdraw",
-        "Withdrawal request"
-    )
-
-    if new_balance is False:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "insufficient_balance",
-
-            "balance":
-                get_balance(telegram_id)
-        }), 400
-
-    if new_balance is None:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "user not found"
-        }), 404
-
-    # --------------------------------------------------------
-    # Create withdrawal
-    # --------------------------------------------------------
-
-    with db_lock:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            INSERT INTO withdrawals (
-                telegram_id,
-                amount,
-                phone,
-                status
-            )
-
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                str(telegram_id),
-                amount,
-                phone,
-                "pending"
-            )
-        )
-
-        withdrawal_id = cur.lastrowid
-
-        conn.commit()
-        conn.close()
-
-    return jsonify({
-
-        "success": True,
-
-        "withdrawal_id":
-            withdrawal_id,
-
-        "amount":
-            amount,
-
-        "phone":
-            phone,
-
-        "status":
-            "pending",
-
-        "balance":
-            new_balance
-    })
-
-
-# ============================================================
-# ADMIN WITHDRAWALS
-# ============================================================
-
-@app.get("/api/admin/withdrawals")
-def admin_withdrawals():
-
-    token = request.headers.get(
-        "X-Admin-Token"
-    )
-
-    if token != ADMIN_TOKEN:
-
-        return jsonify({
-            "success": False,
-            "error": "unauthorized"
-        }), 401
-
-    with db_lock:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT *
-            FROM withdrawals
-            ORDER BY id DESC
-            LIMIT 100
-            """
-        )
-
-        rows = cur.fetchall()
-
-        conn.close()
-
-    withdrawals = []
-
-    for row in rows:
-
-        withdrawals.append(
-            dict(row)
-        )
-
-    return jsonify({
-
-        "success": True,
-
-        "withdrawals":
-            withdrawals
-    })
-
-
-# ============================================================
-# ADMIN WITHDRAWAL STATUS
-# ============================================================
-
-@app.post("/api/admin/withdrawal/<int:withdrawal_id>")
-def admin_withdrawal_update(
-    withdrawal_id
-):
-
-    token = request.headers.get(
-        "X-Admin-Token"
-    )
-
-    if token != ADMIN_TOKEN:
-
-        return jsonify({
-            "success": False,
-            "error": "unauthorized"
-        }), 401
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    status = data.get(
-        "status"
-    )
-
-    if status not in [
-        "approved",
-        "completed",
-        "rejected"
-    ]:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "invalid status"
-        }), 400
-
-    with db_lock:
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-            SELECT *
-            FROM withdrawals
-            WHERE id = ?
-            """,
-            (withdrawal_id,)
-        )
-
-        withdrawal = cur.fetchone()
-
-        if not withdrawal:
-
-            conn.close()
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "withdrawal not found"
-            }), 404
-
-        old_status = withdrawal["status"]
-
-        # ----------------------------------------------------
-        # If rejected, return reserved money.
-        # ----------------------------------------------------
-
-        if (
-            status == "rejected"
-            and old_status
-                not in ["rejected", "completed"]
-        ):
-
-            telegram_id = withdrawal[
-                "telegram_id"
-            ]
-
-            amount = float(
-                withdrawal["amount"]
-            )
-
-            cur.execute(
-                """
-                UPDATE users
-
-                SET balance =
-                    balance + ?,
-
-                    total_withdraw =
-                    CASE
-                        WHEN total_withdraw >= ?
-                        THEN total_withdraw - ?
-                        ELSE 0
-                    END
-
-                WHERE telegram_id = ?
-                """,
-                (
-                    amount,
-                    amount,
-                    amount,
-                    telegram_id
-                )
-            )
-
-            cur.execute(
-                """
-                INSERT INTO transactions (
-                    telegram_id,
-                    type,
-                    amount,
-                    status,
-                    note
-                )
-
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    telegram_id,
-                    "withdraw_refund",
-                    amount,
-                    "completed",
-                    f"Withdrawal {withdrawal_id} rejected"
-                )
-            )
-
-        cur.execute(
-            """
-            UPDATE withdrawals
-
-            SET status = ?
-
-            WHERE id = ?
-            """,
-            (
-                status,
-                withdrawal_id
-            )
-        )
-
-        conn.commit()
-        conn.close()
-
-    return jsonify({
-
-        "success": True,
-
-        "withdrawal_id":
-            withdrawal_id,
-
-        "status":
-            status
-    })
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/")
-def health():
-
-    return jsonify({
-
-        "success": True,
-
-        "service":
-            "Royal Bingo Server",
-
-        "status":
-            "online",
-
-        "webapp":
-            WEBAPP_URL,
-
-        "entry_fee":
-            ENTRY_FEE,
-
-        "max_players":
-            MAX_PLAYERS
-    })
-
-
-# ============================================================
-# FLASK
-# ============================================================
-
-def run_web():
-
-    logger.info(
-        "Royal Bingo API running on port %s",
-        PORT
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        threaded=True
-    )
-
-
-# ============================================================
-# BOT
-# ============================================================
-
-def main():
-
-    init_db()
-
-    web_thread = threading.Thread(
-        target=run_web,
-        daemon=True
-    )
-
-    web_thread.start()
+def build_bot_application():
 
     application = (
         Application
         .builder()
-        .token(TOKEN)
+        .token(BOT_TOKEN)
         .build()
     )
+
 
     application.add_handler(
         CommandHandler(
@@ -2249,24 +3707,205 @@ def main():
         )
     )
 
+
     application.add_handler(
-        CallbackQueryHandler(
-            button_handler
+        MessageHandler(
+            filters.Regex(
+                f"^{BTN_BALANCE}$"
+            ),
+            show_balance
         )
     )
 
-    logger.info(
-        "🎱 Royal Bingo bot started"
+
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(
+                f"^{BTN_SUPPORT}$"
+            ),
+            show_support
+        )
     )
 
+
+    # --------------------------------------------------------
+    # Deposit
+    # --------------------------------------------------------
+
+    deposit_conv = ConversationHandler(
+
+        entry_points=[
+            MessageHandler(
+                filters.Regex(
+                    f"^{BTN_DEPOSIT}$"
+                ),
+                deposit_start
+            )
+        ],
+
+        states={
+
+            DEP_AMOUNT: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    deposit_amount
+                )
+            ],
+
+            DEP_TXNID: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    deposit_txnid
+                )
+            ],
+        },
+
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel_conv
+            )
+        ],
+    )
+
+
+    application.add_handler(
+        deposit_conv
+    )
+
+
+    # --------------------------------------------------------
+    # Withdrawal
+    # --------------------------------------------------------
+
+    withdraw_conv = ConversationHandler(
+
+        entry_points=[
+            MessageHandler(
+                filters.Regex(
+                    f"^{BTN_WITHDRAW}$"
+                ),
+                withdraw_start
+            )
+        ],
+
+        states={
+
+            WD_AMOUNT: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    withdraw_amount
+                )
+            ],
+
+            WD_PHONE: [
+                MessageHandler(
+                    filters.TEXT
+                    & ~filters.COMMAND,
+                    withdraw_phone
+                )
+            ],
+        },
+
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel_conv
+            )
+        ],
+    )
+
+
+    application.add_handler(
+        withdraw_conv
+    )
+
+
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_deposit_callback,
+            pattern=r"^dep_"
+        )
+    )
+
+
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_withdrawal_callback,
+            pattern=r"^wd_"
+        )
+
+
+    )
+
+
+    return application
+
+
+# ============================================================
+# BOT THREAD
+# ============================================================
+
+def run_bot_in_thread():
+
+    loop = asyncio.new_event_loop()
+
+    asyncio.set_event_loop(loop)
+
+
+    application = (
+        build_bot_application()
+    )
+
+
+    log.info(
+        "Telegram bot polling starting..."
+    )
+
+
     application.run_polling(
-        drop_pending_updates=True
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False
     )
 
 
 # ============================================================
-# START
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    init_db()
+
+
+    get_or_create_active_round()
+
+
+    threading.Thread(
+        target=run_bot_in_thread,
+        daemon=True,
+        name="telegram-bot"
+    ).start()
+
+
+    threading.Thread(
+        target=round_engine_loop,
+        daemon=True,
+        name="round-engine"
+    ).start()
+
+
+    log.info(
+        "Flask API starting on port %s ...",
+        PORT
+    )
+
+
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        threaded=True
+    )
